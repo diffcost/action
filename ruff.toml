@@ -1,0 +1,10 @@
+# Lint settings for `ruff check src/ tests/`. They are set here so the check gives the same
+# result on every ruff version: ruff's default rule set changes between releases.
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length
+]

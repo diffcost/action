@@ -1,0 +1,15 @@
+# The Action's direct dependencies. The Docker image installs requirements.txt, a lock of
+# these and every transitive dependency pinned with hashes (pip --require-hashes), so a
+# new upstream release never reaches customers' runs until it is locked here.
+# After editing this file, regenerate the lock with versions at least two weeks old:
+#   uv pip compile requirements.in --universal --python-version 3.11 --generate-hashes \
+#     --exclude-newer "$(date -u -v-14d +%Y-%m-%d)" -o requirements.txt
+# (GNU date: `date -u -d '14 days ago' +%Y-%m-%d`)
+# When pip-audit (CI) flags a locked version whose fix is newer than that cutoff, add a
+# floor below and exempt that package: --exclude-newer-package "<name>=$(date -u +%Y-%m-%d)".
+google-cloud-bigquery>=3.25.0,<4.0.0
+sqlglot>=25.0.0,<26.0.0
+requests>=2.31.0,<3.0.0
+pyyaml>=6.0,<7.0
+# Security floors for transitive dependencies (fixes newer than the two-week cutoff)
+pyasn1>=0.6.5  # CVE-2026-119194..119197

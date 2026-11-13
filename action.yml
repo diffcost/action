@@ -1,0 +1,91 @@
+name: 'DiffCost'
+description: 'Per-run BigQuery cost of SQL and dbt changes in pull requests, with optional merge blocking'
+author: 'DiffCost'
+
+branding:
+  icon: 'bar-chart'
+  color: 'blue'
+
+inputs:
+  github_token:
+    description: 'Token used to post the PR comment. The default workflow token works; the job needs `pull-requests: write`.'
+    required: false
+    default: ${{ github.token }}
+  sql_paths:
+    description: 'Glob pattern for SQL files (e.g., "queries/**/*.sql"). Auto-detected if not set.'
+    required: false
+    default: ''
+  manifest_path:
+    description: 'Path to the dbt manifest.json produced by `dbt compile --target prod` in this run (a committed manifest is rejected). Auto-detected as target/manifest.json next to the base branch''s dbt_project.yml; one dbt project per pull request.'
+    required: false
+    default: ''
+  gcp_credentials:
+    description: 'Raw JSON of a GCP service account key (starting with a { character; not base64-encoded), for BigQuery dry runs. Leave empty when using Workload Identity Federation.'
+    required: false
+    default: ''
+  gcp_project:
+    description: 'GCP project ID that runs the dry-run jobs. Defaults to the project in the credentials.'
+    required: false
+    default: ''
+  api_key:
+    description: 'DiffCost API key. On every plan: results stored in the dashboard. On Starter, Team, Enterprise and the trial: merge blocking, Slack alerts, cost trends. When empty (also a missing or misnamed secret, a fork PR, or a Dependabot PR without the Dependabot secret), no diffcost/cost-check status is posted and the comment says so.'
+    required: false
+    default: ''
+  config_path:
+    description: 'Path to the .diffcost.yml config file. It is always read from the base branch.'
+    required: false
+    default: '.diffcost.yml'
+  base_ref:
+    description: 'Base branch to compare against: a branch name, a refs/heads/ or refs/remotes/ ref, or a full commit SHA (never a tag). Default: the event''s base commit (a pull request''s base commit, or a merge queue commit''s parent; else GITHUB_BASE_REF, resolved as refs/remotes/origin/<branch>). Requires `fetch-depth: 0` on actions/checkout.'
+    required: false
+    default: ''
+  cost_per_tb:
+    description: 'USD per TiB for BigQuery on-demand pricing (default 6.25). With an api_key, the dashboard value is used instead.'
+    required: false
+    default: '6.25'
+  bq_pricing_model:
+    description: 'BigQuery pricing model: "on_demand" (dollar figures) or "editions" (scan bytes only). With an api_key, the dashboard value is used instead.'
+    required: false
+    default: 'on_demand'
+  comment_on_clean:
+    description: 'Post a comment even when the PR changes no SQL. With an API key, a comment is also posted when no `diffcost/cost-check` status could be posted, so the PR says why a required check is waiting (when the token can comment: pull requests from forks get the job summary only).'
+    required: false
+    default: 'false'
+  fail_on_error:
+    description: 'Exit non-zero when DiffCost cannot finish: invalid inputs, a .diffcost.yml that cannot be read or parsed or has an invalid threshold (its policy would be weaker than configured), git or manifest errors, or the backend unreachable or rejecting results. Default false: the step always passes and problems are reported in the log, the PR comment and the job summary. A commit status the backend could not post (GitHub App missing, GitHub error) is reported, not failed, even when true: make diffcost/cost-check a required check so the PR waits for it.'
+    required: false
+    default: 'false'
+  send_author:
+    description: 'Send the PR author''s GitHub login (from the pull request event) to DiffCost for team attribution. Default false.'
+    required: false
+    default: 'false'
+
+outputs:
+  total_cost_delta:
+    description: 'Net cost change in USD per run across all costed queries (positive = increase)'
+  monthly_cost_delta:
+    description: 'total_cost_delta x default_runs_per_month (a projection)'
+  max_query_cost_delta:
+    description: 'Largest single-query cost increase in USD per run (what absolute thresholds compare against); 0 if no query got more expensive'
+  max_regression_pct:
+    description: 'Largest single-query percentage increase'
+  files_analyzed:
+    description: 'Number of SQL files/models analyzed'
+  items_unknown:
+    description: 'Number of analyzed queries whose cost could not be determined (excluded from totals)'
+  blocked:
+    description: 'Whether DiffCost blocked the pull request ("true" or "false"): the cost policy was exceeded AND the failing diffcost/cost-check commit status was posted. Blocking is enforced by that status, not by failing this step.'
+  policy_exceeded:
+    description: 'Whether the cost policy was exceeded ("true" or "false"), whether or not a commit status enforced it (e.g. GitHub App not installed, API key rejected, backend unreachable). Evaluated with an API key on a paid plan or the trial, or when an API key is set but the dashboard config could not be fetched; always "false" on the Free plan.'
+  analysis_status:
+    description: 'ok (analysis ran), no_changes (no SQL changes, or not a pull request), or error (DiffCost could not analyze the PR; see the log and PR comment)'
+  total_bytes_before:
+    description: 'Total BigQuery bytes scanned per run by the base-branch queries'
+  total_bytes_after:
+    description: 'Total BigQuery bytes scanned per run by the PR queries'
+  scan_multiplier:
+    description: 'Ratio of PR scan volume to base scan volume (e.g. 4.20)'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
