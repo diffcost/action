@@ -98,8 +98,8 @@ DiffCost needs BigQuery access in one of two ways: a service account (steps 1 an
 
 Good to know:
 
-- **Plain SQL files** are dry-run as written, so each one must run as it is, with qualified table names and no templating or query parameters, and BigQuery must be able to estimate it before it runs (no external table, no table with row-level security, no script BigQuery stops estimating early). See [what DiffCost can price](https://diffcost.dev/docs/quickstart#what-diffcost-can-price).
-- **dbt projects** need a compiled manifest and, for full results, a baseline manifest from your main branch. Follow [dbt projects](https://diffcost.dev/docs/dbt) for that workflow.
+- **Plain SQL files** are dry-run as written, so each one must run as it is, with no templating, with qualified table names (or a `default_dataset` in `.diffcost.yml`) and a value in `.diffcost.yml` for each query parameter such as `@run_date`, and BigQuery must be able to estimate it before it runs (no external table, no table with row-level security, no script BigQuery stops estimating early). See [what DiffCost can price](https://diffcost.dev/docs/quickstart#what-diffcost-can-price).
+- **dbt projects** need a compiled manifest and, for full results, a baseline manifest: the commit the PR merges into, compiled in the same job. Follow [dbt projects](https://diffcost.dev/docs/dbt) for that workflow.
 - **Run DiffCost once per PR.** Several runs on one PR would share one comment and one commit status.
 - **PRs from forks** get no secrets and a read-only token: DiffCost writes its report to the job summary instead of a comment.
 - **Merge queues** need the `merge_group` trigger and a different `if:` on the auth step. See [merge queues](https://diffcost.dev/docs/merge-blocking#merge-queues).
@@ -190,7 +190,7 @@ GitHub builds the Action on the runner from its `Dockerfile`: the base image is 
 | [Quickstart](https://diffcost.dev/docs/quickstart) | Set up DiffCost on a repository |
 | [How DiffCost works](https://diffcost.dev/docs/how-it-works) | What is compared, priced and flagged |
 | [BigQuery access and keyless auth](https://diffcost.dev/docs/bigquery-access) | Permissions and Workload Identity Federation |
-| [dbt projects](https://diffcost.dev/docs/dbt) | Manifests, baselines and the main-branch artifact |
+| [dbt projects](https://diffcost.dev/docs/dbt) | Manifests and compiling the baseline in the PR's job |
 | [Merge blocking](https://diffcost.dev/docs/merge-blocking) | API key, GitHub App and the `diffcost/cost-check` required check |
 | [Reading the PR comment](https://diffcost.dev/docs/pr-comment) | Every row, message and status |
 | [Thresholds and alerts](https://diffcost.dev/docs/thresholds) | Cost policies and Slack |

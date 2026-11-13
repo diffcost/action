@@ -1,6 +1,7 @@
 """Tests for the dbt manifest adapter."""
 
 import json
+import shutil
 
 import pytest
 
@@ -145,6 +146,7 @@ class TestWithBaseline:
         with pytest.raises(ManifestError) as exc:
             find_changed_dbt_models(_config(repo))
         assert "committed in the repository" in str(exc.value)
+        assert "base commit compiled in the job" in str(exc.value) and "downloaded artifact" in str(exc.value)
 
     def test_symlinked_baseline_directory_fails_closed(self, checkout_repo):
         """`.diffcost-baseline -> evil/` passes `git ls-files .diffcost-baseline/manifest.json`."""
@@ -159,6 +161,7 @@ class TestWithBaseline:
         with pytest.raises(ManifestError) as exc:
             find_changed_dbt_models(_config(repo))
         assert "symlink" in str(exc.value)
+        assert "base commit compiled in the job" in str(exc.value) and "downloaded artifact" in str(exc.value)
 
     def test_unreadable_baseline_fails_closed(self, checkout_repo):
         repo = checkout_repo({"models/a.sql": "select 1"})
@@ -167,6 +170,17 @@ class TestWithBaseline:
         with pytest.raises(ManifestError) as exc:
             find_changed_dbt_models(_config(repo))
         assert "baseline manifest" in str(exc.value)
+
+    def test_uncompiled_baseline_fails_closed(self, checkout_repo):
+        """A baseline written by `dbt parse` has no compiled SQL to compare against."""
+        repo = checkout_repo({"models/a.sql": "select 1"})
+        repo.write("target/manifest.json", _manifest(_node("a", "select 1", checksum="a")))
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("a", None, checksum="a")))
+        with pytest.raises(ManifestError) as exc:
+            find_changed_dbt_models(_config(repo))
+        message = str(exc.value)
+        assert "The baseline manifest `.diffcost-baseline/manifest.json` has no compiled SQL (1 uncompiled" in message
+        assert "Write it with `dbt compile --target prod`, not `dbt parse`." in message
 
 
 class TestSubdirectoryProject:
@@ -268,6 +282,47 @@ class TestWithoutBaseline:
         changed = find_changed_dbt_models(_config(repo))
         assert [c.name for c in changed] == ["b"]
         assert "not compiled in the PR manifest" in changed[0].metadata["unknown_reason"]
+
+
+    def test_warning_names_both_ways_to_write_the_baseline(self, checkout_repo, capsys):
+        repo = checkout_repo({"models/a.sql": "select 1"})
+        repo.write("models/a.sql", "select 2")
+        repo.commit()
+        repo.write("target/manifest.json", _manifest(_node("a", "select 2")))
+
+        find_changed_dbt_models(_config(repo))
+
+        out = capsys.readouterr().out
+        assert "No baseline dbt manifest found" in out
+        assert "base commit" in out and ".diffcost-baseline/manifest.json" in out and "artifact" in out
+        assert "https://diffcost.dev/docs/dbt#the-pull-request-workflow" in out
+
+
+class TestBaselineCompiledInTheJob:
+    """The documented baseline step: `git worktree add` of the base commit outside the
+    workspace, `dbt compile` there, and its manifest copied to .diffcost-baseline/."""
+
+    def test_baseline_from_a_worktree_of_the_base_commit(self, checkout_repo, tmp_path):
+        repo = checkout_repo({"dbt_project.yml": "name: p", "models/a.sql": "select {{ m() }}",
+                              "macros/m.sql": "{% macro m() %}1{% endmacro %}"})
+        base = repo.git("rev-parse", "HEAD").strip()
+        repo.write("macros/m.sql", "{% macro m() %}* from big{% endmacro %}")
+        repo.commit()
+        worktree = tmp_path / "runner_temp" / "base"
+        repo.git("worktree", "add", "--force", "--detach", str(worktree), base)
+        (worktree / "target").mkdir()
+        (worktree / "target" / "manifest.json").write_text(_manifest(_node("a", "select 1", checksum="same")))
+        repo.write(".diffcost-baseline/manifest.json", (worktree / "target" / "manifest.json").read_text())
+        repo.write("target/manifest.json", _manifest(_node("a", "select * from big", checksum="same")))
+        # The Action's container doesn't mount the runner's temp directory: the worktree stays
+        # registered in .git but its directory is missing.
+        shutil.rmtree(worktree)
+
+        changed = find_changed_dbt_models(_config(repo))
+
+        assert [c.name for c in changed] == ["a"]  # the macro change, attributed to its model
+        assert changed[0].production_sql == "select 1"
+        assert changed[0].pr_sql == "select * from big"
 
 
 class TestManifestErrors:
@@ -374,6 +429,7 @@ class TestSymlinkedPrManifest:
         with pytest.raises(ManifestError) as exc:
             find_changed_dbt_models(_config(repo, manifest_path=".diffcost-baseline/manifest.json"))
         assert "same file" in str(exc.value)
+        assert "compile the base commit" in str(exc.value) and "artifact" in str(exc.value)
 
 
 class TestProjectLayout:

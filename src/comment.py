@@ -15,6 +15,7 @@ import re
 import requests
 
 from analysis.table_meta import format_bytes as _format_bytes
+from config import settable_parameter
 
 COMMENT_MARKER = "<!-- diffcost-report -->"
 # GitHub rejects comment bodies over 65,536 characters.
@@ -266,7 +267,7 @@ def classify_cost(
     if baseline_unknown:
         # Before the no-dry-run return: without credentials it must still read as unknown,
         # not as "No structural changes".
-        record.update(status="unknown", reason="no production baseline (dbt manifest artifact missing)")
+        record.update(status="unknown", reason="no production baseline (no baseline manifest in this run)")
         return record
     if dry_run is None:
         return record
@@ -357,6 +358,7 @@ def format_comment(
     slack_failures: list[tuple[str, str]] | None = None,
     subscription_inactive: bool = False,
     threshold_source: str = "",
+    query_parameters: list[tuple[str, str]] | None = None,
 ) -> str:
     """Generate the markdown PR comment body.
 
@@ -372,9 +374,11 @@ def format_comment(
     `subscription_inactive` (from /v1/config): a Stripe subscription that no longer pays,
     so the Free plan line says to update the payment method. `threshold_source` (the
     backend's, or "yml" for a local check of `.diffcost.yml`): a blocked verdict names it,
-    and a paid footer says when no threshold applies ("none").
+    and a paid footer says when no threshold applies ("none"). `query_parameters`: the
+    (name, value) pairs from `.diffcost.yml` that plain SQL files were dry-run with, for a
+    note saying so (None when no plain SQL file was).
 
-    The verdict, the status note, cost-policy warnings and `ignored_paths` hints come
+    The verdict, the status note, cost-policy warnings and the hints on unknown costs come
     right after the title, before the tables, so truncating a long report never drops them.
     """
     lines = [COMMENT_MARKER, ""]
@@ -409,7 +413,7 @@ def format_comment(
         blocks.append([slack_failure_line(source, reason)])
     for warning in policy_warnings or []:
         blocks.append([f"> ⚠️ **Cost policy:** {md_rich(warning, in_table=False)}"])
-    for hint in (_ignore_hint(results), _exempt_hint(results)):
+    for hint in (_ignore_hint(results), _exempt_hint(results), _parameters_hint(results)):
         if hint:
             blocks.append([hint])
     for block in blocks:
@@ -425,6 +429,9 @@ def format_comment(
             f"ℹ️ {items_unknown} {noun} could not be costed and {'is' if items_unknown == 1 else 'are'} "
             "excluded from the totals above."
         )
+    if has_bq_creds and query_parameters:
+        lines.append("")
+        lines.append(query_parameters_line(query_parameters))
     if has_bq_creds and items_not_costed:
         noun = "query reads" if items_not_costed == 1 else "queries read"
         lines.append("")
@@ -533,6 +540,66 @@ def _exempt_hint(results: list[dict]) -> str:
         "costing a file (DiffCost won't price or flag it again), add it to `ignored_paths` in `.diffcost.yml` on "
         "the base branch, in a separate PR: " + _ignored_paths_code(entries)
     )
+
+
+QUERY_PARAMETERS_URL = "https://diffcost.dev/docs/configuration#query-parameters"
+_DATE_PARAMETER_TYPES = ("DATE", "DATETIME", "TIMESTAMP")
+
+
+def _parameters_hint(results: list[dict]) -> str:
+    """How to give values to the query parameters of plain SQL files that have none (the
+    files count as unknown cost until then), and, for parameters `query_parameters` can't set
+    (other types such as arrays and structs, positional `?`), how to stop costing the file."""
+    params: dict[str, tuple[str, str]] = {}
+    for r in results:
+        for name, ptype in r.get("unbound_parameters") or []:
+            kept = params.get(name.lower())
+            if kept is None or (ptype and not kept[1]):
+                params[name.lower()] = (name, ptype)
+    exempt = _collect(results, "parameter_exempt_entry")
+    if not params and not exempt:
+        return ""
+    found = list(params.values())
+    named = [(n, t) for n, t in found if n != "?"]
+    settable = [(n, t) for n, t in found if settable_parameter(n, t)]
+    names = ", ".join(md_code(f"@{n}" + (f" {t}" if t else ""), in_table=False) for n, t in named[:5])
+    if len(named) > 5:
+        names += f" and {len(named) - 5} more"
+    parts = [
+        "> ℹ️ **Some queries use query parameters that have no value**"
+        + (f" ({names})" if names else "") + ", so they count as unknown cost."
+    ]
+    if settable:
+        entries = [
+            f"{n}: {{type: {t}, " + ("days_ago: 1}" if t in _DATE_PARAMETER_TYPES else "value: …}")
+            for n, t in settable[:5] if t
+        ]
+        example = (
+            f", for example: {md_code('query_parameters: {' + ', '.join(entries) + '}', in_table=False)}"
+            if entries else ""
+        )
+        which = "each scalar parameter" if exempt else "each one"
+        parts.append(
+            f"Give {which} a value under `query_parameters` in `.diffcost.yml` on the base branch, in a separate "
+            f"PR{example}."
+        )
+    if exempt:
+        parts.append(
+            "Parameters of other types, such as arrays and structs, and positional parameters (`?`) can't be given "
+            "a value: to stop costing a file that uses them (DiffCost won't price or flag it again), add it to "
+            "`ignored_paths` in `.diffcost.yml` on the base branch, in a separate PR: "
+            + _ignored_paths_code(exempt) + "."
+        )
+    parts.append(f"See [query parameters]({QUERY_PARAMETERS_URL}).")
+    return " ".join(parts)
+
+
+def query_parameters_line(params: list[tuple[str, str]], limit: int = 10) -> str:
+    """The note naming the `.diffcost.yml` parameter values plain SQL files were priced with."""
+    shown = [md_code(f"@{name} = {value}", in_table=False) for name, value in params[:limit]]
+    more = len(params) - limit
+    listed = ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+    return f"ℹ️ Plain SQL files were priced with {listed} (`query_parameters` in `.diffcost.yml`)."
 
 
 _DETAILS_CLOSE = "\n\n</details>"

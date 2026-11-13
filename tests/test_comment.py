@@ -1258,3 +1258,32 @@ class TestAccuracyMarkers:
         body = self._body(rows, items_unknown=5)
         assert "ignored_paths: [" + ", ".join(f'"models/m{i}.sql"' for i in range(5)) + "]" in body
         assert "more files" not in body
+
+
+class TestQueryParameterLines:
+    def test_priced_with_line_escapes_values_and_caps_the_list(self):
+        from comment import query_parameters_line
+        line = query_parameters_line([("s", '"a`b"')] + [(f"p{i}", str(i)) for i in range(11)])
+        assert line.startswith('ℹ️ Plain SQL files were priced with `` @s = "a`b" ``, `@p0 = 0`, ')
+        assert line.endswith("`@p8 = 8` and 2 more (`query_parameters` in `.diffcost.yml`).")
+
+    def test_hint_example_uses_supported_types_only(self):
+        from comment import _parameters_hint
+        hint = _parameters_hint([
+            {"unbound_parameters": [("ids", "ARRAY"), ("when", "TIMESTAMP")]},
+            {"unbound_parameters": [("WHEN", ""), ("label", "")]},
+        ])
+        assert "(`@ids ARRAY`, `@when TIMESTAMP`, `@label`)" in hint
+        assert "for example: `query_parameters: {when: {type: TIMESTAMP, days_ago: 1}}`" in hint
+
+    def test_hint_without_a_known_type_has_no_example(self):
+        from comment import _parameters_hint
+        hint = _parameters_hint([{"unbound_parameters": [("label", "")]}])
+        assert "(`@label`)" in hint and "for example" not in hint
+        assert _parameters_hint([{"unbound_parameters": []}, {}]) == ""
+
+    def test_hint_with_only_parameters_that_cant_be_set(self):
+        from comment import _parameters_hint
+        hint = _parameters_hint([{"unbound_parameters": [("?", "INT64")], "parameter_exempt_entry": "q/a.sql"}])
+        assert hint.startswith("> ℹ️ **Some queries use query parameters that have no value**, so they count")
+        assert "Give each" not in hint and '`ignored_paths: ["q/a.sql"]`' in hint

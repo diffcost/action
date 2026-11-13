@@ -10,10 +10,13 @@ Invalid values never crash the run: they are reported as warnings and ignored.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import yaml
@@ -39,6 +42,31 @@ _DEPENDABOT_LOGIN = "dependabot[bot]"
 DEFAULT_COST_PER_TIB = 6.25
 DEFAULT_RUNS_PER_MONTH = 30
 
+# `query_parameters` in .diffcost.yml: BigQuery's scalar parameter types
+QUERY_PARAMETER_TYPES = ("STRING", "INT64", "FLOAT64", "NUMERIC", "BIGNUMERIC", "BOOL", "DATE", "DATETIME", "TIMESTAMP")
+_DATE_PARAMETER_TYPES = ("DATE", "DATETIME", "TIMESTAMP")
+_PARAMETER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+MAX_QUERY_PARAMETERS = 50
+MAX_DAYS_AGO = 3650
+_MAX_STRING_PARAMETER = 1024
+_INT64_RANGE = (-(2**63), 2**63 - 1)
+# `default_dataset`: project.dataset, the project optionally domain-scoped (example.com:my-project)
+_DEFAULT_DATASET_RE = re.compile(r"^(?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z][a-z0-9-]*[a-z0-9]\.[A-Za-z0-9_]{1,1024}$")
+# BigQuery rejects a NUMERIC / BIGNUMERIC parameter outside these (absolute values below), even
+# when no query uses it, which would fail every plain SQL file's dry run
+_NUMERIC_LIMITS = {"NUMERIC": Decimal(10) ** 29, "BIGNUMERIC": Decimal(10) ** 38}
+_VALUE_FORMS = {
+    "STRING": "a string (at most 1,024 characters)",
+    "INT64": "a whole number",
+    "FLOAT64": "a number",
+    "NUMERIC": "a number whose absolute value is below 10^29, as a number or a string",
+    "BIGNUMERIC": "a number whose absolute value is below 10^38, as a number or a string",
+    "BOOL": "true or false",
+    "DATE": "a date such as 2026-11-01",
+    "DATETIME": "a date and time without a time zone, such as 2026-11-01 06:00:00",
+    "TIMESTAMP": "a date and time such as 2026-11-01 06:00:00 (UTC unless it has an offset)",
+}
+
 
 @dataclass
 class ThresholdConfig:
@@ -49,6 +77,39 @@ class ThresholdConfig:
 
     def is_set(self) -> bool:
         return self.absolute_usd is not None or self.relative_pct is not None
+
+
+def settable_parameter(name: str, ptype: str) -> bool:
+    """Whether `query_parameters` can give a value to the parameter a dry run reported as
+    unbound: a named one of a scalar type, or of a type BigQuery didn't name. Positional
+    parameters (name "?"), arrays and structs can't be given one."""
+    return name != "?" and (not ptype or ptype in QUERY_PARAMETER_TYPES)
+
+
+class _PolicyLoader(yaml.SafeLoader):
+    """yaml.safe_load, except that an unquoted date or timestamp that isn't a real one
+    (`2026-11-31`) stays its text instead of raising ValueError, so only the entry that holds
+    it is rejected, not the whole file."""
+
+
+def _construct_timestamp(loader: yaml.SafeLoader, node):
+    try:
+        return yaml.SafeLoader.construct_yaml_timestamp(loader, node)
+    except (ValueError, OverflowError):
+        return loader.construct_scalar(node)
+
+
+_PolicyLoader.add_constructor("tag:yaml.org,2002:timestamp", _construct_timestamp)
+
+
+@dataclass(frozen=True)
+class QueryParameter:
+    """A value for a named query parameter (`@name`) of plain SQL files, from `.diffcost.yml`."""
+
+    name: str
+    type: str  # one of QUERY_PARAMETER_TYPES
+    value: object  # str, int, float, Decimal, bool, date or datetime, as BigQuery's client takes it
+    display: str  # the value as the PR comment shows it
 
 
 @dataclass
@@ -71,6 +132,10 @@ class ActionConfig:
     # Thresholds as read from the base-branch .diffcost.yml (sent to the backend)
     yml_thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
     ignored_paths: list[str] = field(default_factory=list)
+    # For the dry runs of plain SQL files (not dbt), from .diffcost.yml: the dataset that
+    # unqualified table names resolve in, and values for the files' named query parameters
+    default_dataset: str = ""
+    query_parameters: list[QueryParameter] = field(default_factory=list)
     slack_webhook: str = ""
     default_runs_per_month: int = DEFAULT_RUNS_PER_MONTH
     trial_days_remaining: int | None = None
@@ -328,8 +393,6 @@ def _read_event() -> dict:
     if not event_path or not Path(event_path).exists():
         return {}
     try:
-        import json
-
         with open(event_path) as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
@@ -384,8 +447,8 @@ def _load_diffcost_yml(config: ActionConfig) -> None:
         return
 
     try:
-        raw = yaml.safe_load(result.stdout)
-    except yaml.YAMLError as e:
+        raw = yaml.load(result.stdout, Loader=_PolicyLoader)  # a SafeLoader subclass: no Python objects
+    except (yaml.YAMLError, ValueError) as e:  # ValueError: e.g. an integer too long for Python to read
         _policy_warn(config, f"{yml_path} on {base} is not valid YAML ({str(e)[:120]}). Its thresholds were not applied.")
         return
 
@@ -444,6 +507,164 @@ def _load_diffcost_yml(config: ActionConfig) -> None:
         config.fail_on_error = raw["fail_on_error"]
     if "send_author" in raw and isinstance(raw["send_author"], bool):
         config.send_author = raw["send_author"]
+
+    if raw.get("default_dataset") is not None:
+        config.default_dataset = _parse_default_dataset(raw["default_dataset"], yml_path)
+    if raw.get("query_parameters") is not None:
+        config.query_parameters = _parse_query_parameters(raw["query_parameters"], yml_path, _utcnow())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_default_dataset(raw, yml_path: str) -> str:
+    value = raw.strip() if isinstance(raw, str) else ""
+    if not _DEFAULT_DATASET_RE.fullmatch(value):
+        _warn(f"{yml_path}: default_dataset must be `project.dataset` (got {str(raw)[:80]!r}). Ignoring it.")
+        return ""
+    return value
+
+
+def _parse_query_parameters(raw, yml_path: str, now: datetime) -> list[QueryParameter]:
+    """Values for named query parameters. An invalid entry is warned about and left out, so
+    the files that use that parameter stay unknown cost (BigQuery then reports it as unbound)."""
+    if not isinstance(raw, dict):
+        _warn(
+            f"{yml_path}: query_parameters must be a mapping from parameter names to "
+            "{type, value} or {type, days_ago}. Ignoring it."
+        )
+        return []
+    entries = list(raw.items())
+    if len(entries) > MAX_QUERY_PARAMETERS:
+        _warn(f"{yml_path}: query_parameters has more than {MAX_QUERY_PARAMETERS} entries. Only the first "
+              f"{MAX_QUERY_PARAMETERS} are used.")
+        entries = entries[:MAX_QUERY_PARAMETERS]
+    params: list[QueryParameter] = []
+    seen: set[str] = set()
+    for name, spec in entries:
+        if not isinstance(name, str) or not _PARAMETER_NAME_RE.fullmatch(name):
+            _warn(f"{yml_path}: query_parameters has an invalid parameter name {str(name)[:60]!r} (letters, digits "
+                  "and underscores, not starting with a digit). Ignoring it.")
+            continue
+        key = f"{yml_path}: query_parameters.{name}"
+        if name.lower() in seen:  # BigQuery matches parameter names without regard to case
+            _warn(f"{key} repeats a parameter name (names are case-insensitive). Ignoring it.")
+            continue
+        param = _parse_query_parameter(name, spec, key, now)
+        if param is not None:
+            seen.add(name.lower())
+            params.append(param)
+    return params
+
+
+def _parse_query_parameter(name: str, spec, key: str, now: datetime) -> QueryParameter | None:
+    if not isinstance(spec, dict):
+        _warn(f"{key} must be a mapping such as {{type: DATE, days_ago: 1}}. Ignoring it.")
+        return None
+    unknown = sorted(str(k)[:30] for k in spec if k not in ("type", "value", "days_ago"))
+    if unknown:
+        _warn(f"{key} has unknown keys ({', '.join(unknown[:5])}); the keys are type, value and days_ago. Ignoring it.")
+        return None
+    ptype = spec.get("type")
+    ptype = ptype.strip().upper() if isinstance(ptype, str) else ""
+    if ptype not in QUERY_PARAMETER_TYPES:
+        _warn(f"{key}: type must be one of {', '.join(QUERY_PARAMETER_TYPES)}. Ignoring it.")
+        return None
+    if ("value" in spec) == ("days_ago" in spec):
+        _warn(f"{key} needs exactly one of value and days_ago. Ignoring it.")
+        return None
+    if "days_ago" in spec:
+        if ptype not in _DATE_PARAMETER_TYPES:
+            _warn(f"{key}: days_ago works only with the types DATE, DATETIME and TIMESTAMP. Ignoring it.")
+            return None
+        days = spec["days_ago"]
+        if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= MAX_DAYS_AGO:
+            _warn(f"{key}: days_ago must be a whole number from 0 to {MAX_DAYS_AGO:,}. Ignoring it.")
+            return None
+        day = now.astimezone(timezone.utc).date() - timedelta(days=days)
+        value = day if ptype == "DATE" else datetime.combine(day, time())
+        if ptype == "TIMESTAMP":
+            value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = _parameter_value(ptype, spec["value"])
+        if value is None:
+            _warn(f"{key}: value must be {_VALUE_FORMS[ptype]}. Ignoring it.")
+            return None
+    return QueryParameter(name=name, type=ptype, value=value, display=_parameter_display(ptype, value))
+
+
+def _parameter_value(ptype: str, raw):
+    """`raw` (as YAML parsed it) as the Python value BigQuery's client takes for `ptype`, or
+    None when it isn't one. YAML already turns unquoted dates and timestamps into date and
+    datetime objects; quoted ones arrive as strings."""
+    if raw is None:
+        return None
+    if ptype == "BOOL":
+        return raw if isinstance(raw, bool) else None
+    if isinstance(raw, bool):
+        return None
+    if ptype == "STRING":
+        return raw if isinstance(raw, str) and len(raw) <= _MAX_STRING_PARAMETER else None
+    if ptype == "INT64":
+        return raw if isinstance(raw, int) and _INT64_RANGE[0] <= raw <= _INT64_RANGE[1] else None
+    if ptype == "FLOAT64":
+        if not isinstance(raw, (int, float)):
+            return None
+        try:
+            number = float(raw)
+        except OverflowError:  # an integer beyond the float range
+            return None
+        return number if math.isfinite(number) else None
+    if ptype in ("NUMERIC", "BIGNUMERIC"):
+        if not isinstance(raw, (int, float, str)):
+            return None
+        try:
+            number = Decimal(str(raw).strip())
+        except (InvalidOperation, ValueError):
+            return None
+        return number if number.is_finite() and abs(number) < _NUMERIC_LIMITS[ptype] else None
+    if ptype == "DATE":
+        if isinstance(raw, datetime):
+            return None
+        if isinstance(raw, date):
+            return raw
+        return _parse_iso(date.fromisoformat, raw)
+    parsed = raw if isinstance(raw, datetime) else _parse_iso(datetime.fromisoformat, raw)
+    if parsed is None and isinstance(raw, date):
+        parsed = datetime.combine(raw, time())
+    if parsed is None:
+        return None
+    if ptype == "DATETIME":
+        return parsed if parsed.tzinfo is None else None
+    # TIMESTAMP: without an offset, the time is UTC
+    try:
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except OverflowError:  # an offset that moves it out of the datetime range (year 1 or 9999)
+        return None
+
+
+def _parse_iso(parse, raw):
+    if not isinstance(raw, str):
+        return None
+    try:
+        return parse(raw.strip())
+    except ValueError:
+        return None
+
+
+def _parameter_display(ptype: str, value) -> str:
+    if ptype == "STRING":
+        text = json.dumps(value, ensure_ascii=False)
+        return text if len(text) <= 60 else text[:57] + "…\""
+    if ptype == "BOOL":
+        return "true" if value else "false"
+    if ptype == "DATE":
+        return value.isoformat()
+    if ptype in ("DATETIME", "TIMESTAMP"):
+        text = value.strftime("%Y-%m-%d %H:%M:%S") + (f".{value.microsecond:06d}" if value.microsecond else "")
+        return text + " UTC" if ptype == "TIMESTAMP" else text
+    return str(value)
 
 
 # Env vars that may be resolved via ${{ VAR_NAME }} in .diffcost.yml.

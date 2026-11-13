@@ -41,7 +41,7 @@ from comment import (
     truncate_summary,
     unestimated_removal,
 )
-from config import DEFAULT_RUNS_PER_MONTH, ActionConfig, ThresholdConfig, load_config
+from config import DEFAULT_RUNS_PER_MONTH, ActionConfig, ThresholdConfig, load_config, settable_parameter
 
 # google-api-core warns at import that Google will stop supporting the image's Python
 # version in its future releases. Customers can't act on it, and the lock pins the version.
@@ -476,6 +476,10 @@ def run(config: ActionConfig) -> int:
         slack_failures=slack_failures,
         subscription_inactive=config.subscription_inactive,
         threshold_source=threshold_source,
+        query_parameters=(
+            [(p.name, p.display) for p in config.query_parameters]
+            if any(r.get("priced_with_parameters") for r in results) else None
+        ),
     )
     if config.merge_group:
         pass  # a merge queue has no PR comment: the job summary is the report
@@ -675,7 +679,7 @@ def _table_info(dr: dict | None, table_meta: dict) -> dict:
 
 def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta_cache=None) -> dict:
     """`meta_cache` (TableMetaCache): reads the metadata of the tables the dry runs reference."""
-    from analysis.accuracy import assess
+    from analysis.accuracy import assess, unbound_parameters
     from analysis.bq_dryrun import dry_run_pair
     from adapters.sql_files import exempt_entry
     from analysis.structural import analyze_structural_changes
@@ -691,6 +695,12 @@ def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta
     }
     baseline_unknown = bool(meta.get("baseline_unknown"))
     unknown_reason = str(meta.get("unknown_reason") or "")
+    # .diffcost.yml's default dataset and query parameter values are for plain SQL files:
+    # dbt's compiled SQL names its relations in full and has no parameters
+    plain_sql = item.adapter == "sql_files"
+    options = (
+        {"default_dataset": config.default_dataset, "query_parameters": config.query_parameters} if plain_sql else {}
+    )
 
     # A modified dbt model without a baseline is unknown cost whatever the dry run says,
     # so it doesn't spend the shared dry-run time budget
@@ -699,8 +709,10 @@ def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta
         if time.monotonic() - started_at > DRY_RUN_BUDGET_SECONDS:
             dr = {"error": "skipped: dry-run time budget exceeded", "cost_before": None, "cost_after": None}
         else:
+            # The comment says which values were used (format_comment's `query_parameters`)
+            result["priced_with_parameters"] = bool(plain_sql and config.query_parameters)
             try:
-                dr = dry_run_pair(bq_client, item.production_sql, item.pr_sql, config.cost_per_tb)
+                dr = dry_run_pair(bq_client, item.production_sql, item.pr_sql, config.cost_per_tb, **options)
             except Exception as e:
                 dr = {"error": f"dry run failed ({type(e).__name__})", "cost_before": None, "cost_after": None}
         if not dr.get("error"):
@@ -756,7 +768,16 @@ def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta
             # on it (unparseable SQL, a failed check): "no risk found" is not known (fail closed).
             # A new model has no earlier version to compare, so it stays exempt.
             rec.update(blocking=True, blocking_note=STRUCTURAL_NOT_RUN)
-    if rec["status"] == "unknown" and (result["dry_run"] or {}).get("unknown_reason") and item.path:
+    unbound = unbound_parameters(result["dry_run"] or {})
+    if rec["status"] == "unknown" and unbound:
+        # Fixed by giving the parameters values, not by exempting the file, except for those
+        # `query_parameters` can't set (arrays, structs, positional `?`). The comment says how
+        # for plain SQL files (`query_parameters` doesn't apply to dbt models).
+        if plain_sql:
+            result["unbound_parameters"] = unbound
+            if item.path and not all(settable_parameter(name, ptype) for name, ptype in unbound):
+                result["parameter_exempt_entry"] = exempt_entry(item.path)
+    elif rec["status"] == "unknown" and (result["dry_run"] or {}).get("unknown_reason") and item.path:
         # BigQuery can't estimate this query before it runs: the comment says how to exempt the file
         result["exempt_entry"] = exempt_entry(item.path)
     result["cost"] = rec

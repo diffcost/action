@@ -477,3 +477,194 @@ class TestEventEdgeCases:
         assert config.git_error == ""
         assert config.resolved_base_ref == main
         assert config.base_ref == "main"
+
+
+class TestPlainSqlDryRunOptions:
+    """`default_dataset` and `query_parameters` in .diffcost.yml, read from the base commit."""
+
+    NOW = "config._utcnow"
+
+    def _load(self, checkout_repo, yml: str, pr_yml: str | None = None):
+        from datetime import datetime, timezone
+
+        repo = checkout_repo({".diffcost.yml": yml})
+        if pr_yml is not None:
+            repo.write(".diffcost.yml", pr_yml)
+            repo.commit()
+        with patch.dict(os.environ, _env(str(repo.path))), \
+                patch(self.NOW, return_value=datetime(2026, 11, 14, 15, 30, tzinfo=timezone.utc)):
+            return load_config()
+
+    def _params(self, config):
+        return {p.name: (p.type, p.value, p.display) for p in config.query_parameters}
+
+    def test_read_from_base_commit_not_the_pr(self, checkout_repo):
+        config = self._load(
+            checkout_repo,
+            "default_dataset: my-project.analytics\nquery_parameters:\n  country: {type: STRING, value: US}\n",
+            pr_yml="default_dataset: other-project.secrets\nquery_parameters:\n  country: {type: STRING, value: XX}\n",
+        )
+        assert config.default_dataset == "my-project.analytics"
+        assert self._params(config) == {"country": ("STRING", "US", '"US"')}
+
+    def test_days_ago_is_counted_from_the_utc_date_of_the_run(self, checkout_repo):
+        from datetime import date, datetime, timezone
+
+        config = self._load(checkout_repo, (
+            "query_parameters:\n"
+            "  run_date: {type: DATE, days_ago: 1}\n"
+            "  run_time: {type: timestamp, days_ago: 1}\n"
+            "  local_time: {type: DATETIME, days_ago: 0}\n"
+        ))
+        params = self._params(config)
+        assert params["run_date"] == ("DATE", date(2026, 11, 13), "2026-11-13")
+        assert params["run_time"] == (
+            "TIMESTAMP", datetime(2026, 11, 13, tzinfo=timezone.utc), "2026-11-13 00:00:00 UTC"
+        )
+        assert params["local_time"] == ("DATETIME", datetime(2026, 11, 14), "2026-11-14 00:00:00")
+
+    def test_values_of_every_type(self, checkout_repo):
+        from datetime import date, datetime, timezone
+        from decimal import Decimal
+
+        config = self._load(checkout_repo, (
+            "query_parameters:\n"
+            "  s: {type: STRING, value: 'it''s'}\n"
+            "  i: {type: INT64, value: -42}\n"
+            "  f: {type: FLOAT64, value: 2}\n"
+            "  n: {type: NUMERIC, value: '12.50'}\n"
+            "  b: {type: BIGNUMERIC, value: 7}\n"
+            "  ok: {type: BOOL, value: false}\n"
+            "  d: {type: DATE, value: 2026-11-01}\n"
+            "  dq: {type: DATE, value: '2026-11-02'}\n"
+            "  dt: {type: DATETIME, value: '2026-11-01 06:30:00'}\n"
+            "  ts: {type: TIMESTAMP, value: '2026-11-01T06:30:00+10:00'}\n"
+            "  tsz: {type: TIMESTAMP, value: 2026-11-01T06:30:00Z}\n"
+            "  tsd: {type: TIMESTAMP, value: 2026-11-01}\n"
+        ))
+        params = self._params(config)
+        assert params["s"] == ("STRING", "it's", '"it\'s"')
+        assert params["i"] == ("INT64", -42, "-42")
+        assert params["f"] == ("FLOAT64", 2.0, "2.0")
+        assert params["n"] == ("NUMERIC", Decimal("12.50"), "12.50")
+        assert params["b"] == ("BIGNUMERIC", Decimal("7"), "7")
+        assert params["ok"] == ("BOOL", False, "false")
+        assert params["d"][1] == date(2026, 11, 1) and params["dq"][1] == date(2026, 11, 2)
+        assert params["dt"] == ("DATETIME", datetime(2026, 11, 1, 6, 30), "2026-11-01 06:30:00")
+        # An offset is converted to UTC; without one the time is UTC
+        assert params["ts"][1] == datetime(2026, 10, 31, 20, 30, tzinfo=timezone.utc)
+        assert params["ts"][2] == "2026-10-31 20:30:00 UTC"
+        assert params["tsz"][1] == datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc)
+        assert params["tsd"][1] == datetime(2026, 11, 1, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize("entry, message", [
+        ("{type: DATE}", "exactly one of value and days_ago"),
+        ("{type: DATE, value: 2026-11-01, days_ago: 1}", "exactly one of value and days_ago"),
+        ("{type: ARRAY, value: [1]}", "type must be one of"),
+        ("{value: x}", "type must be one of"),
+        ("{type: STRING, days_ago: 1}", "days_ago works only with the types DATE, DATETIME and TIMESTAMP"),
+        ("{type: DATE, days_ago: -1}", "days_ago must be a whole number from 0 to 3,650"),
+        ("{type: DATE, days_ago: 3651}", "days_ago must be a whole number"),
+        ("{type: DATE, days_ago: true}", "days_ago must be a whole number"),
+        ("{type: DATE, days_ago: '1'}", "days_ago must be a whole number"),
+        ("{type: DATE, value: null}", "value must be a date"),
+        ("{type: DATE, value: 'yesterday'}", "value must be a date"),
+        ("{type: DATE, value: 2026-11-01T06:00:00Z}", "value must be a date"),
+        ("{type: INT64, value: '42'}", "value must be a whole number"),
+        ("{type: INT64, value: 9223372036854775808}", "value must be a whole number"),
+        ("{type: INT64, value: true}", "value must be a whole number"),
+        ("{type: FLOAT64, value: .nan}", "value must be a number"),
+        ("{type: NUMERIC, value: 'abc'}", "value must be a number whose absolute value is below 10^29"),
+        # BigQuery rejects these even when no query uses them, which would fail every dry run
+        ("{type: NUMERIC, value: 1E+30}", "value must be a number whose absolute value is below 10^29"),
+        ("{type: NUMERIC, value: '-1E+29'}", "value must be a number whose absolute value is below 10^29"),
+        ("{type: BIGNUMERIC, value: '1E+40'}", "value must be a number whose absolute value is below 10^38"),
+        # Values Python can't represent are rejected with the type's message, never a crash
+        ("{type: DATE, value: 2026-11-31}", "value must be a date"),
+        ("{type: TIMESTAMP, value: 2026-02-30 06:00:00}", "value must be a date and time"),
+        (f"{{type: FLOAT64, value: {10**309}}}", "value must be a number"),
+        ("{type: TIMESTAMP, value: '0001-01-01T00:00:00+10:00'}", "value must be a date and time"),
+        ("{type: BOOL, value: 'true'}", "value must be true or false"),
+        ("{type: STRING, value: 42}", "value must be a string"),
+        ("{type: DATETIME, value: '2026-11-01T06:00:00+00:00'}", "without a time zone"),
+        ("{type: DATE, days_ago: 1, default: 2}", "unknown keys (default)"),
+        ("DATE", "must be a mapping such as {type: DATE, days_ago: 1}"),
+    ])
+    def test_invalid_entries_are_warned_about_and_left_out(self, checkout_repo, capsys, entry, message):
+        config = self._load(checkout_repo, f"query_parameters:\n  run_date: {entry}\n  ok: {{type: BOOL, value: true}}\n")
+        assert [p.name for p in config.query_parameters] == ["ok"]
+        out = capsys.readouterr().out
+        assert "::warning::.diffcost.yml: query_parameters.run_date" in out and message in out
+        assert not config.policy_warnings  # stricter, never weaker: the files stay unknown cost
+
+    def test_invalid_and_repeated_names(self, checkout_repo, capsys):
+        config = self._load(checkout_repo, (
+            "query_parameters:\n"
+            "  1st: {type: INT64, value: 1}\n"
+            "  run-date: {type: DATE, days_ago: 1}\n"
+            '  "run_time\\n": {type: DATE, days_ago: 1}\n'  # `$` alone would match before the newline
+            "  run_date: {type: DATE, days_ago: 1}\n"
+            "  RUN_DATE: {type: DATE, days_ago: 2}\n"
+        ))
+        assert [p.name for p in config.query_parameters] == ["run_date"]
+        out = capsys.readouterr().out
+        assert out.count("invalid parameter name") == 3
+        assert "query_parameters.RUN_DATE repeats a parameter name" in out
+
+    def test_large_values_in_the_numeric_ranges_are_kept(self, checkout_repo):
+        from decimal import Decimal
+
+        config = self._load(checkout_repo, (
+            "query_parameters:\n"
+            "  n: {type: NUMERIC, value: 1E+28}\n"
+            "  b: {type: BIGNUMERIC, value: '-9.9E+37'}\n"
+        ))
+        assert self._params(config) == {
+            "n": ("NUMERIC", Decimal("1E+28"), "1E+28"), "b": ("BIGNUMERIC", Decimal("-9.9E+37"), "-9.9E+37"),
+        }
+
+    def test_an_impossible_date_elsewhere_in_the_file_is_not_fatal(self, checkout_repo):
+        """PyYAML raises ValueError for 2026-11-31; the rest of the file still applies."""
+        config = self._load(checkout_repo, (
+            "thresholds:\n  absolute: 5\n"
+            "release_freeze: 2026-11-31\n"
+            "query_parameters:\n  run_date: {type: DATE, value: 2026-11-01}\n"
+        ))
+        assert config.thresholds.absolute_usd == 5.0 and not config.policy_warnings
+        assert [p.name for p in config.query_parameters] == ["run_date"]
+
+    def test_an_unreadable_file_is_a_policy_warning_not_a_crash(self, checkout_repo):
+        """A ValueError that isn't a timestamp (an integer too long for Python) can't crash the run."""
+        config = self._load(checkout_repo, "thresholds:\n  absolute: " + "9" * 5000 + "\n")
+        assert config.thresholds.absolute_usd is None
+        assert any("is not valid YAML" in w for w in config.policy_warnings)
+
+    def test_at_most_fifty_entries(self, checkout_repo, capsys):
+        entries = "".join(f"  p{i}: {{type: INT64, value: {i}}}\n" for i in range(52))
+        config = self._load(checkout_repo, "query_parameters:\n" + entries)
+        assert len(config.query_parameters) == 50 and config.query_parameters[-1].name == "p49"
+        assert "more than 50 entries" in capsys.readouterr().out
+
+    def test_query_parameters_must_be_a_mapping(self, checkout_repo, capsys):
+        config = self._load(checkout_repo, "query_parameters:\n  - run_date\n")
+        assert config.query_parameters == []
+        assert "query_parameters must be a mapping" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("value, expected", [
+        ("my-project.analytics", "my-project.analytics"),
+        ("example.com:my-project.analytics_v2", "example.com:my-project.analytics_v2"),
+        ("analytics", ""),
+        ("my-project.analytics.orders", ""),
+        ("my-project:analytics", ""),
+        ("`my-project.analytics`", ""),
+        ("42", ""),
+    ])
+    def test_default_dataset(self, checkout_repo, capsys, value, expected):
+        config = self._load(checkout_repo, f"default_dataset: '{value}'\n")
+        assert config.default_dataset == expected
+        assert ("default_dataset must be `project.dataset`" in capsys.readouterr().out) is (not expected)
+
+    def test_absent_keys_leave_the_defaults(self, checkout_repo, capsys):
+        config = self._load(checkout_repo, "thresholds:\n  absolute: 5\n")
+        assert config.default_dataset == "" and config.query_parameters == []
+        assert "::warning::" not in capsys.readouterr().out

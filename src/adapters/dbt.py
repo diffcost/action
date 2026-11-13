@@ -49,8 +49,9 @@ class ManifestError(RuntimeError):
     """The PR manifest cannot be used for analysis."""
 
 
-# Baseline manifest locations, in priority order. These must come from a downloaded
-# artifact, never from a file committed in the PR (the PR author controls those).
+# Baseline manifest locations, in priority order. The file must be written during the run
+# (the base commit compiled in the job, or a downloaded artifact), never a file committed
+# in the PR (the PR author controls those).
 _BASELINE_CANDIDATES = (".diffcost-baseline/manifest.json", "target/prod-manifest.json")
 
 # Node types whose `relation_name` can appear in another model's compiled SQL
@@ -179,7 +180,7 @@ def find_changed_dbt_models(config: ActionConfig) -> list[ChangedSQL]:
     head_projects = base_dbt_project_dirs(workspace, "HEAD")  # includes projects the PR adds
     outside = _outside_project_item(changed_paths, layout, base_projects, ignored, head_projects)
 
-    # Load production manifest (from GitHub Actions artifact or base branch)
+    # Load the baseline manifest (written in the run, or the base branch's committed copy)
     prod = _load_production_manifest(workspace, config, project_dir, pr_manifest_path, pr.project_name or layout.name)
 
     if prod is None:
@@ -654,10 +655,11 @@ def _changed_without_baseline(
     unknown item, so a threshold still blocks.
     """
     print(
-        "::warning::No production dbt manifest found. Only models whose files changed in this PR "
-        "are analyzed, and modified models show 'cost unavailable'. Upload `target/manifest.json` "
-        "from your main branch as an artifact and download it to `.diffcost-baseline/` "
-        "(see https://diffcost.dev/docs/dbt#save-the-main-branch-manifest)."
+        "::warning::No baseline dbt manifest found. Only models whose files changed in this PR "
+        "are analyzed, and modified models show 'cost unavailable'. Compile the PR's base commit in "
+        "this job and copy its `target/manifest.json` to `.diffcost-baseline/manifest.json`, or "
+        "download a main-branch manifest artifact there "
+        "(see https://diffcost.dev/docs/dbt#the-pull-request-workflow)."
     )
 
     results = []
@@ -866,10 +868,11 @@ def _load_production_manifest(
 ) -> Manifest | None:
     """
     Load the production manifest. Try these sources in order:
-    1. A downloaded artifact at .diffcost-baseline/manifest.json or target/prod-manifest.json.
-       A candidate that exists but is committed in the repository, reached through a
-       symlink, unreadable or uncompiled is an error: the PR author could plant it to
-       turn off change detection, so it is never skipped silently.
+    1. A file written during the run at .diffcost-baseline/manifest.json or
+       target/prod-manifest.json: the base commit compiled in the job, or a downloaded
+       artifact. A candidate that exists but is committed in the repository, reached
+       through a symlink, unreadable or uncompiled is an error: the PR author could plant
+       it to turn off change detection, so it is never skipped silently.
     2. The base branch, via `git show <base>:<manifest_path>` (if the manifest is committed)
     """
     for candidate in _BASELINE_CANDIDATES:
@@ -879,18 +882,21 @@ def _load_production_manifest(
         if not _is_plain_file(workspace, candidate):
             raise ManifestError(
                 f"The baseline manifest `{candidate}` is a symlink or inside a symlinked directory. "
-                "A production baseline must be a downloaded artifact: remove the symlink from the repository."
+                "The baseline must be a file written in this run (the base commit compiled in the job, "
+                "or a downloaded artifact): remove the symlink from the repository."
             )
         if is_tracked(workspace, candidate):
             raise ManifestError(
                 f"The baseline manifest `{candidate}` is committed in the repository, so a pull request could "
-                "edit it. A production baseline must come from a downloaded artifact: remove it from git."
+                "edit it. The baseline must be written in this run (the base commit compiled in the job, "
+                "or a downloaded artifact): remove it from git."
             )
         if _same_file(p, pr_manifest_path):
             raise ManifestError(
                 f"The baseline manifest `{candidate}` is the same file as `{config.manifest_path}`, so every model "
-                "would compare equal. Compile the PR manifest to `target/manifest.json` and download the "
-                "production manifest to `.diffcost-baseline/`."
+                "would compare equal. Compile the PR manifest to `target/manifest.json`, and write the "
+                "baseline to `.diffcost-baseline/manifest.json` (compile the base commit there, or "
+                "download a main-branch manifest artifact)."
             )
         try:
             manifest = _parse_manifest(p, project_dir, root_package)
@@ -899,7 +905,7 @@ def _load_production_manifest(
         if not manifest.models:
             raise ManifestError(
                 f"The baseline manifest `{candidate}` has no compiled SQL ({manifest.uncompiled} uncompiled "
-                "model(s)). Save it from `dbt compile --target prod` on your main branch."
+                "model(s)). Write it with `dbt compile --target prod`, not `dbt parse`."
             )
         if manifest.uncompiled:
             print(f"::warning::{manifest.uncompiled} model(s) in the baseline manifest have no compiled SQL.")

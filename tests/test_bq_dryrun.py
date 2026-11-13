@@ -394,3 +394,148 @@ class TestEstimateAccuracy:
         result = dry_run_pair(client, "SELECT 1", "SELECT 2")
         assert result["accuracy_before"] == "PRECISE" and result["accuracy_after"] == "LOWER_BOUND"
         assert result["unknown_reason"] == ""
+
+
+class TestQueryParameters:
+    """Named query parameters: values from .diffcost.yml, and parameters with no value."""
+
+    def _job(self, num_bytes, undeclared=None):
+        job = MagicMock(total_bytes_processed=num_bytes, total_bytes_billed=num_bytes,
+                        referenced_tables=[], statement_type="SELECT")
+        query = {"totalBytesProcessedAccuracy": "PRECISE"}
+        if undeclared is not None:
+            query["undeclaredQueryParameters"] = undeclared
+        job._properties = {"statistics": {"query": query}}
+        return job
+
+    def _param(self, name, ptype, value):
+        from config import QueryParameter
+        return QueryParameter(name=name, type=ptype, value=value, display=str(value))
+
+    def test_job_config_without_options_sets_neither(self):
+        client = MagicMock()
+        client.query.return_value = self._job(1)
+        dry_run(client, "SELECT 1")
+        job_config = client.query.call_args.kwargs["job_config"]
+        assert job_config.default_dataset is None and job_config.query_parameters == []
+
+    def test_job_config_gets_the_dataset_and_parameters(self):
+        import datetime
+        client = MagicMock()
+        client.query.return_value = self._job(1)
+        params = [self._param("run_date", "DATE", datetime.date(2026, 11, 13)), self._param("n", "INT64", 3)]
+        dry_run(client, "SELECT @n", default_dataset="my-project.analytics", query_parameters=params)
+        job_config = client.query.call_args.kwargs["job_config"]
+        assert (job_config.default_dataset.project, job_config.default_dataset.dataset_id) == ("my-project", "analytics")
+        api = [p.to_api_repr() for p in job_config.query_parameters]
+        assert api == [
+            {"name": "run_date", "parameterType": {"type": "DATE"}, "parameterValue": {"value": "2026-11-13"}},
+            {"name": "n", "parameterType": {"type": "INT64"}, "parameterValue": {"value": "3"}},
+        ]
+        assert job_config.dry_run is True and job_config.use_query_cache is False
+
+    def test_undeclared_parameters_are_listed(self):
+        """With no parameters set, BigQuery binds them as NULL and still returns an estimate."""
+        client = MagicMock()
+        client.query.return_value = self._job(0, [
+            {"name": "run_date", "parameterType": {"type": "DATE"}},
+            {"name": "Label", "parameterType": {"type": "INT64"}},
+            {"name": "x"},
+            "junk",
+        ])
+        result = dry_run(client, "SELECT @Label FROM t WHERE d = @run_date AND x = @x")
+        assert result["bytes_processed"] == 0 and result["error"] is None
+        # An entry without a usable name (here "junk") is still unbound: never priced
+        assert result["unbound_parameters"] == [("?", ""), ("Label", "INT64"), ("run_date", "DATE"), ("x", "")]
+
+    def test_positional_parameter_is_unbound(self):
+        client = MagicMock()
+        client.query.side_effect = [self._job(1), self._job(0, [{"parameterType": {"type": "INT64"}}])]
+        result = dry_run_pair(client, "SELECT 1", "SELECT ? AS n")
+        assess(result, {})
+        assert result["unknown_reason"] == "the PR version uses query parameters that have no value: ? (INT64)"
+        assert result["cost_after"] is None
+
+    def test_undeclared_parameters_in_an_unexpected_shape_are_unbound(self):
+        client = MagicMock()
+        client.query.return_value = self._job(0, {"name": "x"})
+        assert dry_run(client, "SELECT @x")["unbound_parameters"] == [("x", "")]
+        client.query.return_value = self._job(0, "x")
+        assert dry_run(client, "SELECT @x")["unbound_parameters"] == [("?", "")]
+
+    def test_no_undeclared_parameters(self):
+        client = MagicMock()
+        client.query.return_value = self._job(5)
+        assert dry_run(client, "SELECT 1")["unbound_parameters"] == []
+
+    def test_missing_parameter_error_is_an_unbound_parameter_not_an_error(self):
+        """With some parameters set, BigQuery rejects the query when it uses another one."""
+        client = MagicMock()
+        client.query.side_effect = Exception(
+            "400 POST https://bigquery.googleapis.com/bigquery/v2/projects/p/jobs: "
+            "Query parameter 'label' not found at [1:14]"
+        )
+        result = dry_run(client, "SELECT @label", query_parameters=[self._param("run_date", "DATE", "2026-11-13")])
+        assert result["error"] is None and result["bytes_processed"] is None
+        assert result["unbound_parameters"] == [("label", "")]
+
+    def test_pair_passes_the_options_to_both_versions(self):
+        client = MagicMock()
+        client.query.side_effect = [self._job(GIB), self._job(2 * GIB)]
+        params = [self._param("n", "INT64", 1)]
+        result = dry_run_pair(client, "SELECT 1", "SELECT 2", 6.25, default_dataset="p.d", query_parameters=params)
+        assert result["cost_after"] == pytest.approx(2 * 6.25 / 1024)
+        for call in client.query.call_args_list:
+            assert str(call.kwargs["job_config"].default_dataset) == "p.d"
+            assert len(call.kwargs["job_config"].query_parameters) == 1
+
+    def test_unbound_parameters_make_that_version_unknown_cost(self):
+        client = MagicMock()
+        client.query.side_effect = [
+            self._job(GIB),
+            self._job(0, [{"name": "run_date", "parameterType": {"type": "DATE"}}]),
+        ]
+        result = dry_run_pair(client, "SELECT 1", "SELECT 2 WHERE d = @run_date")
+        assess(result, {})
+        assert result["unknown_reason"] == "the PR version uses query parameters that have no value: @run_date (DATE)"
+        # The 0-byte estimate is never shown, summed or sent; the base version's figure stays
+        assert result["bytes_after"] is None and result["cost_after"] is None
+        assert result["bytes_before"] == GIB
+
+    def test_both_versions_with_unbound_parameters(self):
+        client = MagicMock()
+        client.query.side_effect = [
+            self._job(0, [{"name": "run_date", "parameterType": {"type": "DATE"}}]),
+            Exception("Query parameter 'country' not found at [3:9]"),
+        ]
+        result = dry_run_pair(client, "SELECT @run_date", "SELECT @run_date, @country",
+                              query_parameters=[self._param("other", "INT64", 1)])
+        assess(result, {})
+        assert result["unknown_reason"] == (
+            "both versions use query parameters that have no value: @run_date (DATE), @country"
+        )
+        assert result["cost_before"] is None and result["cost_after"] is None and result["error"] is None
+
+    @pytest.mark.parametrize("other", ["row_level_security", "LOWER_BOUND", "UNKNOWN"])
+    def test_unbound_parameters_come_before_other_reasons(self, other):
+        client = MagicMock()
+        job = self._job(None if other == "row_level_security" else 5, [{"name": "a", "parameterType": {"type": "STRING"}}])
+        if other == "row_level_security":
+            job._properties["statistics"]["rowLevelSecurityStatistics"] = {"rowLevelSecurityApplied": True}
+        else:
+            job._properties["statistics"]["query"]["totalBytesProcessedAccuracy"] = other
+        client.query.side_effect = [self._job(1), job]
+        result = dry_run_pair(client, "SELECT 1", "SELECT @a")
+        assess(result, {})
+        assert result["unknown_reason"].startswith("the PR version uses query parameters that have no value: @a")
+        assert result["cost_after"] is None and result["bytes_after"] is None
+
+    def test_reason_lists_at_most_five_parameters(self):
+        from analysis.accuracy import parameter_list
+        params = [(f"p{i}", "INT64") for i in range(7)]
+        assert parameter_list(params) == "@p0 (INT64), @p1 (INT64), @p2 (INT64), @p3 (INT64), @p4 (INT64) and 2 more"
+
+    def test_parameter_names_merge_without_regard_to_case(self):
+        from analysis.accuracy import unbound_parameters
+        dr = {"unbound_parameters_before": [("Run_Date", "")], "unbound_parameters_after": [("run_date", "DATE")]}
+        assert unbound_parameters(dr) == [("run_date", "DATE")]

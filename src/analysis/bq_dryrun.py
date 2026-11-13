@@ -22,6 +22,9 @@ _MISSING_OBJECT_RE = re.compile(r"not found:\s*(table|dataset|view)\s+([^\s,;]+)
 # "Unrecognized name: discount_pct" — on the PR side this usually means the query reads a
 # column that an upstream model in the same PR adds (prod does not have it yet).
 _UNRECOGNIZED_NAME_RE = re.compile(r"unrecognized name:", re.IGNORECASE)
+# "Query parameter 'run_date' not found at [1:40]": the query uses a named parameter that the
+# job doesn't set, while it sets others (with none set, BigQuery binds every one as NULL)
+_MISSING_PARAMETER_RE = re.compile(r"query parameter '([A-Za-z_][A-Za-z0-9_]*)' not found", re.IGNORECASE)
 
 
 def _container_credentials_path(path: str) -> str:
@@ -110,7 +113,25 @@ def _job_statistics(job) -> tuple[dict, dict]:
     return stats, query if isinstance(query, dict) else {}
 
 
-def dry_run(client: bigquery.Client, sql: str) -> dict:
+def _undeclared_parameters(query_stats: dict) -> list[tuple[str, str]]:
+    """(name, type) of the parameters a dry run found no value for
+    (`undeclaredQueryParameters`, with the type BigQuery inferred), sorted by name. An entry
+    without a usable name (a positional `?` parameter, or one this code can't read) is "?",
+    and an unreadable type is "": either way the version is never priced."""
+    found = query_stats.get("undeclaredQueryParameters")
+    if not found:
+        return []
+    params: dict[str, str] = {}
+    for entry in found if isinstance(found, list) else [found]:
+        entry = entry if isinstance(entry, dict) else {}
+        name = entry.get("name")
+        ptype = entry.get("parameterType")
+        ptype = ptype.get("type") if isinstance(ptype, dict) else None
+        params.setdefault(name if isinstance(name, str) and name else "?", ptype if isinstance(ptype, str) else "")
+    return sorted(params.items(), key=lambda p: p[0].lower())
+
+
+def dry_run(client: bigquery.Client, sql: str, default_dataset: str = "", query_parameters=None) -> dict:
     """
     Submit a dry-run job to BigQuery.
     Returns dict with bytes_processed, cost estimate, or error.
@@ -120,14 +141,26 @@ def dry_run(client: bigquery.Client, sql: str) -> dict:
     PRECISE, UPPER_BOUND for clustered tables, LOWER_BOUND for external tables and for
     scripts it stops estimating early). `row_level_security`: the query reads a table with
     row access policies, for which BigQuery returns no byte estimate (bytes_processed None).
+
+    `default_dataset` ("project.dataset") and `query_parameters` (config.QueryParameter) are
+    set on the job when given. `unbound_parameters` lists the (name, type) of named
+    parameters the query uses without a value: with no parameters set, BigQuery binds them
+    as NULL and still returns an estimate (often 0 bytes, because `= NULL` matches nothing),
+    so that estimate can't be trusted; with some set, a missing one fails the dry run, and
+    is reported here instead of as an error (type "", which BigQuery doesn't name then).
     """
     if not sql or not sql.strip():
         return {"error": "Empty SQL"}
 
-    # No query cache: a cached result would make the dry run report 0 bytes billed
-    job_config = bigquery.QueryJobConfig(dry_run=True, use_legacy_sql=False, use_query_cache=False)
-
     try:
+        # No query cache: a cached result would make the dry run report 0 bytes billed
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_legacy_sql=False, use_query_cache=False)
+        if default_dataset:
+            job_config.default_dataset = default_dataset
+        if query_parameters:
+            job_config.query_parameters = [
+                bigquery.ScalarQueryParameter(p.name, p.type, p.value) for p in query_parameters
+            ]
         job = client.query(
             sql,
             job_config=job_config,
@@ -163,8 +196,19 @@ def dry_run(client: bigquery.Client, sql: str) -> dict:
             "accuracy": accuracy if isinstance(accuracy, str) else None,
             "statement_type": statement_type if isinstance(statement_type, str) else None,
             "row_level_security": row_level_security,
+            "unbound_parameters": _undeclared_parameters(query_stats),
         }
     except Exception as e:
+        missing_parameter = _MISSING_PARAMETER_RE.search(str(e))
+        if missing_parameter:
+            return {
+                "bytes_processed": None,
+                "referenced_tables": [],
+                "unmaterialized_upstream": False,
+                "unrecognized_name": False,
+                "error": None,
+                "unbound_parameters": [(missing_parameter.group(1), "")],
+            }
         if _is_unmaterialized(e):
             return {
                 "bytes_processed": None,
@@ -194,6 +238,8 @@ def dry_run_pair(
     production_sql: str | None,
     pr_sql: str | None,
     cost_per_tb: float = 6.25,
+    default_dataset: str = "",
+    query_parameters=None,
 ) -> dict:
     """
     Dry-run both production and PR versions of a query.
@@ -210,7 +256,10 @@ def dry_run_pair(
     Per side (`_before` / `_after`): `accuracy` and `statement_type` from BigQuery, the
     referenced tables (`tables_before` / `tables_after`; in memory only, never sent), and
     `rls_before` / `rls_after` when that side reads a table with row-level security (no byte
-    estimate). accuracy.assess turns those into `unknown_reason`.
+    estimate). `unbound_parameters_before` / `unbound_parameters_after`: the named parameters
+    that version uses without a value. accuracy.assess turns those into `unknown_reason`.
+
+    `default_dataset` and `query_parameters` apply to both versions (see `dry_run`).
     """
     result = {
         "cost_before": None,
@@ -228,11 +277,15 @@ def dry_run_pair(
         "accuracy_after": None,
         "statement_type_before": None,
         "statement_type_after": None,
+        "unbound_parameters_before": [],
+        "unbound_parameters_after": [],
         "unknown_reason": "",
     }
+    options = {"default_dataset": default_dataset, "query_parameters": query_parameters}
     # Dry-run production version
     if production_sql:
-        prod_result = dry_run(client, production_sql)
+        prod_result = dry_run(client, production_sql, **options)
+        result["unbound_parameters_before"] = prod_result.get("unbound_parameters") or []
         if prod_result.get("unmaterialized_upstream"):
             result["unmaterialized_upstream"] = True
         elif prod_result.get("error"):
@@ -249,7 +302,8 @@ def dry_run_pair(
 
     # Dry-run PR version
     if pr_sql:
-        pr_result = dry_run(client, pr_sql)
+        pr_result = dry_run(client, pr_sql, **options)
+        result["unbound_parameters_after"] = pr_result.get("unbound_parameters") or []
         # A base that hit row-level security did run: its reason is the one to show
         base_ok = not production_sql or result["cost_before"] is not None or result["rls_before"]
         missing = pr_result.get("unmaterialized_upstream") or pr_result.get("unrecognized_name")

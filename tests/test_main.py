@@ -1719,3 +1719,143 @@ class TestBillingStateAndPolicySource:
         assert "unsuspend it in the organization's **Settings → GitHub Apps → DiffCost**" in body
         assert harness.outputs()["blocked"] == "false" and harness.outputs()["policy_exceeded"] == "true"
         assert "suspended in this organization" in capsys.readouterr().out
+
+
+class TestPlainSqlQueryParameters:
+    """`default_dataset` and `query_parameters` from .diffcost.yml, and parameters with no value."""
+
+    def _params(self):
+        import datetime
+
+        from config import QueryParameter
+        return [
+            QueryParameter("run_date", "DATE", datetime.date(2026, 11, 13), "2026-11-13"),
+            QueryParameter("country", "STRING", "US", '"US"'),
+        ]
+
+    def _config(self, **kwargs):
+        config = _make_config(**kwargs)
+        config.default_dataset = "secret-project.secret_dataset"
+        config.query_parameters = self._params()
+        return config
+
+    def test_plain_sql_dry_runs_get_the_dataset_and_parameters(self, harness):
+        harness.find.return_value = [_item("daily")]
+        harness.pair.return_value = _pair(1.0, 1.5)
+        config = self._config()
+        run(config)
+        kwargs = harness.pair.call_args.kwargs
+        assert kwargs == {"default_dataset": "secret-project.secret_dataset", "query_parameters": config.query_parameters}
+        body = harness.post.call_args.args[3]
+        assert (
+            'ℹ️ Plain SQL files were priced with `@run_date = 2026-11-13`, `@country = "US"` '
+            "(`query_parameters` in `.diffcost.yml`)." in body
+        )
+
+    def test_dbt_models_get_neither(self, harness):
+        harness.find.return_value = [_item("fct", adapter="dbt")]
+        harness.pair.return_value = _pair(1.0, 1.5)
+        run(self._config())
+        assert harness.pair.call_args.kwargs == {}
+        assert "priced with" not in harness.post.call_args.args[3]
+
+    def test_no_note_without_parameters_or_without_dry_runs(self, harness):
+        harness.find.return_value = [_item("daily")]
+        harness.pair.return_value = _pair(1.0, 1.5)
+        run(_make_config())
+        assert "priced with" not in harness.post.call_args.args[3]
+        harness.bq.return_value = None  # no BigQuery credentials: nothing was priced
+        run(self._config())
+        assert "priced with" not in harness.post.call_args.args[3]
+
+    def test_unbound_parameters_block_and_say_how_to_set_them(self, harness):
+        """A dry run binds a parameter with no value as NULL: often 0 bytes, never trusted."""
+        harness.find.return_value = [_item("daily")]
+        pair = _pair(before=0.0, after=0.0)
+        pair.update(accuracy_before="PRECISE", accuracy_after="PRECISE",
+                    unbound_parameters_before=[("run_date", "DATE")],
+                    unbound_parameters_after=[("run_date", "DATE"), ("country", "STRING")])
+        harness.pair.return_value = pair
+        run(_paid(_make_config(), absolute_usd=5.0))
+        assert harness.outputs()["policy_exceeded"] == "true"
+        payload = harness.send.call_args.args[1]
+        assert payload["items_unknown"] == 1 and payload["queries"] == []
+        body = harness.post.call_args.args[3]
+        assert (
+            "Cost unavailable: both versions use query parameters that have no value: "
+            "@⁠run\\_date (DATE), @⁠country (STRING)" in body
+        )
+        assert (
+            "> ℹ️ **Some queries use query parameters that have no value** (`@run_date DATE`, `@country STRING`), "
+            "so they count as unknown cost. Give each one a value under `query_parameters` in `.diffcost.yml` on "
+            "the base branch, in a separate PR, for example: "
+            "`query_parameters: {run_date: {type: DATE, days_ago: 1}, country: {type: STRING, value: …}}`. "
+            "See [query parameters](https://diffcost.dev/docs/configuration#query-parameters)." in body
+        )
+        # The fix is a value, not exempting the file
+        assert "ignored_paths" not in body
+
+    def test_unbound_parameters_in_a_dbt_model_get_no_hint(self, harness):
+        harness.find.return_value = [_item("fct", adapter="dbt")]
+        pair = _pair(before=1.0, after=0.0)
+        pair.update(accuracy_before="PRECISE", accuracy_after="PRECISE", unbound_parameters_after=[("x", "INT64")])
+        harness.pair.return_value = pair
+        run(_make_config())
+        body = harness.post.call_args.args[3]
+        assert "query parameters that have no value: @⁠x (INT64)" in body
+        assert "Some queries use query parameters" not in body and "ignored_paths" not in body
+
+    def test_deleted_query_with_unbound_parameters_stays_removed(self, harness):
+        harness.find.return_value = [_item("old", pr_sql=None)]
+        pair = _pair(before=0.0)
+        pair.update(accuracy_before="PRECISE", unbound_parameters_before=[("run_date", "DATE")])
+        harness.pair.return_value = pair
+        run(_paid(_make_config(), absolute_usd=5.0))
+        assert harness.outputs()["policy_exceeded"] == "false"
+        body = harness.post.call_args.args[3]
+        assert "Removed** (not estimated: the base version uses query parameters" in body
+        assert "Some queries use query parameters" not in body
+
+    def test_payload_carries_no_dataset_or_parameter(self, harness):
+        """Zero data retention: the settings change the dry runs, never what reaches the backend,
+        also for a query whose parameters have no value."""
+        import copy
+
+        pairs = [_pair(1.0, 2.0), dict(_pair(0.0, 0.0), accuracy_before="PRECISE", accuracy_after="PRECISE",
+                                       unbound_parameters_after=[("run_date", "DATE"), ("country_code", "STRING")])]
+        payloads = []
+        for config in (_make_config(), self._config()):
+            harness.find.return_value = [_item("daily"), _item("weekly")]
+            harness.pair.side_effect = [copy.deepcopy(p) for p in pairs]
+            run(_paid(config, absolute_usd=5.0))
+            payloads.append(harness.send.call_args.args[1])
+        assert payloads[0] == payloads[1]
+        assert payloads[1]["items_unknown"] == 1
+        raw = json.dumps(payloads[1])
+        for forbidden in ("secret-project", "secret_dataset", "run_date", "country", "2026-11-13", '"US"', "@"):
+            assert forbidden not in raw
+
+    def test_array_parameters_can_be_exempted_with_ignored_paths(self, harness):
+        """`query_parameters` can't give an array (or struct, or positional) parameter a value,
+        so the hint says how to stop costing the file instead."""
+        harness.find.return_value = [_item("daily"), _item("tags")]
+        harness.pair.side_effect = [
+            dict(_pair(0.0, 0.0), accuracy_before="PRECISE", accuracy_after="PRECISE",
+                 unbound_parameters_after=[("run_date", "DATE")]),
+            dict(_pair(0.0, 0.0), accuracy_before="PRECISE", accuracy_after="PRECISE",
+                 unbound_parameters_after=[("tags", "ARRAY"), ("?", "INT64")]),
+        ]
+        run(_paid(_make_config(), absolute_usd=5.0))
+        body = harness.post.call_args.args[3]
+        assert (
+            "> ℹ️ **Some queries use query parameters that have no value** (`@run_date DATE`, `@tags ARRAY`), so "
+            "they count as unknown cost. Give each scalar parameter a value under `query_parameters` in "
+            "`.diffcost.yml` on the base branch, in a separate PR, for example: "
+            "`query_parameters: {run_date: {type: DATE, days_ago: 1}}`. Parameters of other types, such as arrays "
+            "and structs, and positional parameters (`?`) can't be given a value: to stop costing a file that uses "
+            "them (DiffCost won't price or flag it again), add it to `ignored_paths` in `.diffcost.yml` on the base "
+            'branch, in a separate PR: `ignored_paths: ["queries/tags.sql"]`. '
+            "See [query parameters](https://diffcost.dev/docs/configuration#query-parameters)." in body
+        )
+        assert "Cost unavailable: the PR version uses query parameters that have no value: @\u2060tags (ARRAY), ? (INT64)" in body
+        assert "BigQuery can't estimate some queries" not in body  # the row-level security / lower-bound hint

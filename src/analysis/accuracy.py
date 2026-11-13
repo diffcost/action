@@ -7,6 +7,9 @@ CALL, EXECUTE IMMEDIATE, IF, WHILE or FOR). A lower bound can hide any cost, so 
 cost unknown (fail closed); an upper bound is shown with a "≤" marker. A missing accuracy
 field is trusted, except for a version that reads an external table: its estimate is
 treated as a lower bound. A table with row-level security gets no byte estimate at all.
+A version that uses named query parameters without a value is unknown cost too: BigQuery
+binds them as NULL in the dry run, so a filter such as `date = @run_date` matches nothing
+and the estimate is usually 0 bytes.
 """
 
 from __future__ import annotations
@@ -29,21 +32,27 @@ def assess(dr: dict, meta: dict) -> None:
     tables it references:
 
     - `unknown_reason`, the one place it is set for an estimate BigQuery can't stand behind:
-      either version reads a table with row-level security (no byte estimate), or its
-      estimate is only a lower bound, or of unknown accuracy (BigQuery's UNKNOWN, or a value
-      this code doesn't know);
+      either version uses query parameters that have no value, or reads a table with
+      row-level security (no byte estimate), or its estimate is only a lower bound, or of
+      unknown accuracy (BigQuery's UNKNOWN, or a value this code doesn't know);
     - that version's bytes and cost are dropped (None, like a version with no estimate), so
       a figure that could hide any cost is never shown, summed or sent, also when the item
       stays costed because the PR deletes the query;
     - `upper_bound_before` / `upper_bound_after`: that version's figure is an upper bound.
     """
+    unbound = [side for side, key in _SIDES if dr.get(f"unbound_parameters_{key}")]
     rls = [side for side, key in _SIDES if dr.get(f"rls_{key}")]
     lower = [side for side, key in _SIDES if _lower_bound(dr, meta, key)]
     other = [
         side for side, key in _SIDES
         if dr.get(f"accuracy_{key}") not in (None, PRECISE, UPPER_BOUND, LOWER_BOUND)
     ]
-    if rls:
+    if unbound:
+        who = versions_label(unbound)
+        uses = "use" if who == "both versions" else "uses"
+        names = parameter_list(unbound_parameters(dr))
+        dr["unknown_reason"] = f"{who} {uses} query parameters that have no value: {names}"
+    elif rls:
         who = versions_label(rls)
         dr["unknown_reason"] = (
             f"{who} {_reads(who)} a table with row-level security, "
@@ -53,11 +62,32 @@ def assess(dr: dict, meta: dict) -> None:
         dr["unknown_reason"] = _lower_bound_reason(dr, meta, lower)
     elif other:
         dr["unknown_reason"] = f"BigQuery doesn't know how accurate the dry run of {versions_label(other)} is"
-    untrusted = [key for side, key in _SIDES if side in lower or side in other]
+    untrusted = [key for side, key in _SIDES if side in unbound or side in lower or side in other]
     for key in untrusted:
         dr[f"bytes_{key}"] = dr[f"cost_{key}"] = None
     for _side, key in _SIDES:
         dr[f"upper_bound_{key}"] = dr.get(f"accuracy_{key}") == UPPER_BOUND
+
+
+def unbound_parameters(dr: dict) -> list[tuple[str, str]]:
+    """(name, type) of the query parameters either version uses without a value, base
+    version first; type "" when BigQuery didn't infer one."""
+    found: dict[str, tuple[str, str]] = {}  # BigQuery matches parameter names without regard to case
+    for _side, key in _SIDES:
+        for name, ptype in dr.get(f"unbound_parameters_{key}") or []:
+            kept = found.get(name.lower())
+            if kept is None or (ptype and not kept[1]):
+                found[name.lower()] = (name, ptype)
+    return list(found.values())
+
+
+def parameter_list(params: list[tuple[str, str]], limit: int = 5) -> str:
+    """"@run_date (DATE), @country (STRING)", the first `limit` and how many more; a
+    positional parameter (name "?") shows as "?"."""
+    labels = [name if name == "?" else f"@{name}" for name, _ptype in params[:limit]]
+    shown = [f"{label} ({ptype})" if ptype else label for label, (_name, ptype) in zip(labels, params)]
+    more = len(params) - limit
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
 
 
 def _lower_bound(dr: dict, meta: dict, key: str) -> bool:
