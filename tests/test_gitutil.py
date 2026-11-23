@@ -224,3 +224,21 @@ class TestMergeQueueCheckout:
         repo = checkout_repo({"a.sql": "SELECT 1"})
         with pytest.raises(GitError, match="merge queue's base commit `ffffffffffff` is not in the checkout"):
             resolve_base_ref(str(repo.path), "main", base_sha="f" * 40, merge_group=True)
+
+
+class TestMergeBase:
+    def test_a_commit_missing_from_the_checkout_names_the_fetch_depth_fix(self, checkout_repo):
+        from gitutil import merge_base
+
+        repo = checkout_repo({"a.sql": "SELECT 1"})
+        with pytest.raises(GitError, match="fetch-depth: 0"):
+            merge_base(str(repo.path), "d" * 40)
+
+    def test_the_branch_point(self, checkout_repo):
+        from gitutil import merge_base
+
+        repo = checkout_repo({"a.sql": "SELECT 1"})
+        base = repo.git("rev-parse", "HEAD").strip()
+        repo.write("a.sql", "SELECT 2")
+        repo.commit()
+        assert merge_base(str(repo.path), "origin/main") == base

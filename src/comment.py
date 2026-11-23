@@ -17,6 +17,9 @@ import requests
 from analysis.table_meta import format_bytes as _format_bytes
 from config import settable_parameter
 
+# The reason a dbt model without a baseline shows (the dbt adapter keeps it next to another one)
+NO_BASELINE_REASON = "no production baseline (no baseline manifest in this run)"
+
 COMMENT_MARKER = "<!-- diffcost-report -->"
 # GitHub rejects comment bodies over 65,536 characters.
 MAX_COMMENT_CHARS = 65_000
@@ -267,7 +270,7 @@ def classify_cost(
     if baseline_unknown:
         # Before the no-dry-run return: without credentials it must still read as unknown,
         # not as "No structural changes".
-        record.update(status="unknown", reason="no production baseline (no baseline manifest in this run)")
+        record.update(status="unknown", reason=NO_BASELINE_REASON)
         return record
     if dry_run is None:
         return record
@@ -385,10 +388,11 @@ def format_comment(
 
     if has_bq_creds:
         report = _format_cost_report(
-            results, total_before, total_after, total_delta, bq_pricing_model, runs_per_month, worst_query
+            results, total_before, total_after, total_delta, bq_pricing_model, runs_per_month, worst_query,
+            blocked=blocked,
         )
     else:
-        report = _format_structural_report(results, bq_error)
+        report = _format_structural_report(results, bq_error, blocked=blocked)
     # report[0] is the title line, report[1] a blank line
     lines.extend(report[:2])
 
@@ -708,8 +712,14 @@ def _format_cost_report(
     bq_pricing_model: str,
     runs_per_month: int,
     worst_query: dict | None,
+    blocked: bool = False,
 ) -> list[str]:
-    """Format the cost comparison table (per-run costs, scan delta)."""
+    """Format the cost comparison table (per-run costs, scan delta). When the cost policy is
+    exceeded (`blocked`), the summary line is never a ✅: a relative threshold on a small
+    increase, an unknown cost or a blocking Not costed row exceeds the policy while the costed
+    queries' total falls."""
+    # The verdict above the table says why the policy is exceeded
+    exceeded = ", but the cost policy is exceeded (see above)"
     is_editions = bq_pricing_model == "editions"
     lines = ["💰 **DiffCost** — BigQuery Cost Report" + ("" if is_editions else " (cost per run)"), ""]
 
@@ -727,6 +737,9 @@ def _format_cost_report(
     upper_noted = False  # a row outside the totals shows an upper-bound figure
     unestimated_removals = 0  # deleted queries BigQuery couldn't estimate (not in the totals)
     uncosted_rows = 0  # unknown and Not costed rows
+    # The costed row whose scan rose most (the first of equals): (scan change, name). On Editions
+    # the summary is about bytes, and one query's rise counts whatever the total does.
+    worst_scan: tuple[int, str] | None = None
 
     for r in results:
         rec = _cost_record(r)
@@ -748,10 +761,12 @@ def _format_cost_report(
             if rec.get("blocking"):
                 label += f" ({rec.get('blocking_note') or 'structural cost risk'}, so it counts as unknown)"
             before_str = "—"
-            if rec["cost_before"] is not None and not is_editions:
-                # The base figure is shown, though not summed: an upper bound keeps its mark and note
+            if rec["cost_before"] is not None and (not is_editions or dr.get("bytes_before") is not None):
+                # The base figure (bytes on Editions) is shown, though not summed: an upper bound
+                # keeps its mark and note
                 up = bool(dr.get("upper_bound_before"))
-                before_str = _upper(_format_cost(rec["cost_before"]), up)
+                figure = _format_bytes(dr["bytes_before"]) if is_editions else _format_cost(rec["cost_before"])
+                before_str = _upper(figure, up)
                 upper_noted |= up
             lines.append(f"| {name} | {before_str} | — | — | {label} |")
             continue
@@ -769,6 +784,9 @@ def _format_cost_report(
             total_bytes_before += bb or 0
             total_bytes_after += ba or 0
         known_rows += 1
+        scan_change = (ba or 0) - (bb or 0)
+        if worst_scan is None or scan_change > worst_scan[0]:
+            worst_scan = (scan_change, r["name"])
         # BigQuery's estimate is an upper bound for that version (clustered tables)
         up_before = bool(dr.get("upper_bound_before")) and bb is not None
         up_after = bool(dr.get("upper_bound_after")) and ba is not None
@@ -783,6 +801,9 @@ def _format_cost_report(
                 change_str = "**New** [Editions - Slot Based]"
             elif rec["status"] == "removed":
                 change_str = "**Removed** [Editions - Slot Based]"
+            elif not bb and ba:
+                # No multiplier from 0 B: the scan itself is the change
+                change_str = f"+{_upper(_format_bytes(ba), up_after)} from 0 B [Editions - Slot Based]"
             else:
                 mult = (ba / bb) if bb else 1.0
                 change_str = (
@@ -830,11 +851,24 @@ def _format_cost_report(
                 f"⚠️ This PR increases query scan volume by **{_format_bytes(total_bytes_after - total_bytes_before)}** "
                 "per run (Editions slot-based pricing: exact cost depends on slot reservation)."
             )
-        elif total_bytes_after < total_bytes_before:
+        elif worst_scan and worst_scan[0] > 0:
+            # Savings elsewhere offset it, but thresholds apply to the worst single query
+            net = total_bytes_after - total_bytes_before
             lines.append(
-                f"✅ This PR **reduces** query scan volume by **{_format_bytes(total_bytes_before - total_bytes_after)}** "
-                "per run (Editions slot-based pricing)."
+                f"⚠️ {md_code(worst_scan[1], in_table=False)} scans **+{_format_bytes(worst_scan[0])}** more per run; "
+                f"savings in other queries offset it (net {'+' if net >= 0 else '-'}{_format_bytes(abs(net))}, "
+                "Editions slot-based pricing)."
             )
+        elif total_bytes_after < total_bytes_before:
+            saved = _format_bytes(total_bytes_before - total_bytes_after)
+            if blocked:
+                lines.append(
+                    f"ℹ️ The costed queries scan **{saved}** less per run in total (Editions slot-based pricing){exceeded}."
+                )
+            else:
+                lines.append(f"✅ This PR **reduces** query scan volume by **{saved}** per run (Editions slot-based pricing).")
+        elif blocked:
+            lines.append(f"ℹ️ No scan volume change in the costed queries (Editions slot-based pricing){exceeded}.")
         else:
             lines.append("✅ No scan volume change detected (Editions slot-based pricing).")
     else:
@@ -851,10 +885,14 @@ def _format_cost_report(
                 f"savings in other queries offset it (net {net})."
             )
         elif total_delta < -0.005:
-            lines.append(
-                f"✅ This PR **reduces** query costs by **{_format_cost(abs(total_delta))}/run** "
-                f"({_format_pct(total_delta, total_before)}, {_monthly(total_delta, runs_per_month)})."
-            )
+            saved = f"**{_format_cost(abs(total_delta))}/run**"
+            figures = f"({_format_pct(total_delta, total_before)}, {_monthly(total_delta, runs_per_month)})"
+            if blocked:
+                lines.append(f"ℹ️ The costed queries cost {saved} less in total {figures}{exceeded}.")
+            else:
+                lines.append(f"✅ This PR **reduces** query costs by {saved} {figures}.")
+        elif blocked:
+            lines.append(f"ℹ️ No significant cost change in the costed queries{exceeded}.")
         else:
             lines.append("✅ No significant cost change detected.")
 
@@ -909,8 +947,9 @@ def _format_finding(f, in_table: bool = True) -> str:
     return text
 
 
-def _format_structural_report(results: list[dict], bq_error: str) -> list[str]:
-    """Format the structural-only report (no usable BigQuery client)."""
+def _format_structural_report(results: list[dict], bq_error: str, blocked: bool = False) -> list[str]:
+    """Format the structural-only report (no usable BigQuery client). When the cost policy is
+    exceeded (`blocked`: every query is unknown cost without a dry run), there is no ✅ line."""
     lines = ["💰 **DiffCost** — SQL Change Analysis", ""]
     if bq_error:
         lines.append(
@@ -927,7 +966,12 @@ def _format_structural_report(results: list[dict], bq_error: str) -> list[str]:
     has_findings = any(r.get("structural_findings") for r in results)
     flagged = [r for r in results if _explicit_unknown(r)]
     if not has_findings and not flagged:
-        lines.append("✅ No structural cost risks detected in changed SQL files.")
+        if blocked:
+            lines.append(
+                "ℹ️ No structural cost risks detected in changed SQL files, but the cost policy is exceeded (see above)."
+            )
+        else:
+            lines.append("✅ No structural cost risks detected in changed SQL files.")
         return lines
 
     lines.append("| File | Changes Detected | Risk |")

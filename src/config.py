@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -26,7 +26,11 @@ from gitutil import (
     base_dbt_project_dirs,
     check_checkout_is_merge_group,
     check_checkout_matches_pr,
+    commit_sha,
     explain_git_failure,
+    merge_base,
+    paths_changed_between,
+    require_repository,
     resolve_base_ref,
     run_git,
 )
@@ -177,12 +181,21 @@ class ActionConfig:
     # BigQuery credentials were provided but a client could not be created
     bq_client_error: str = ""
 
-    # Commit SHA actually used for diffs and for reading .diffcost.yml; empty when unresolved
+    # The resolved base as a commit SHA (empty when unresolved): `.diffcost.yml` and the dbt
+    # project layout are read from it, and files are compared with its merge base with HEAD
+    # (`compare_base`)
     resolved_base_ref: str = ""
     # Why the base ref could not be resolved (surfaced instead of "no changes")
     git_error: str = ""
     # What `base_dbt_project_dirs` last listed, with the workspace and commit it is for
     _base_projects: tuple[str, str, list[str]] | None = field(default=None, init=False, repr=False, compare=False)
+    # What `compare_base` last found, with the workspace and base it is for:
+    # (workspace, base, merge base, the base's own SHA)
+    _compare_base: tuple[str, str, str, str] | None = field(default=None, init=False, repr=False, compare=False)
+    # What `base_moved_paths` last found, with the workspace and the two commits it is for
+    _base_moved: tuple[str, str, str, frozenset[str]] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def base_dbt_project_dirs(self) -> list[str] | None:
         """Directories ("" = repo root) holding a dbt_project.yml on the base commit, or
@@ -202,8 +215,57 @@ class ActionConfig:
 
     @property
     def base_rev(self) -> str:
-        """The ref to diff against: the resolved ref when known, else the raw input."""
+        """The resolved base when known, else the raw input. The cost policy
+        (`.diffcost.yml`) and the dbt project layout are read from it."""
         return self.resolved_base_ref or self.base_ref
+
+    def compare_base(self) -> str:
+        """The commit the PR's files are compared with: where its branch meets the base
+        (`git merge-base <base> HEAD`). On GitHub's merge commit and on a merge queue run
+        that is the base itself. When the base has moved on since the branch started, its
+        later commits aren't the PR's changes, so the list of changed files and each file's
+        earlier version both come from this one commit (a notice in the log names it). The
+        policy is still read from the base: the PR author chooses where the branch starts.
+        Raises GitError when the two share no commit in the checkout."""
+        if self.git_error:
+            raise GitError(self.git_error)
+        workspace = self.workspace or "."
+        base = self.base_rev
+        kept = self._compare_base
+        if kept is None or kept[:2] != (workspace, base):
+            found = merge_base(workspace, base)
+            kept = self._compare_base = (workspace, base, found, commit_sha(workspace, base))
+            if found != kept[3]:
+                print(
+                    f"::notice::The changed files are compared with commit {found[:12]}, where this branch meets "
+                    f"{self.base_label}: commits the base gained since then are not counted as changes. With dbt, "
+                    "compile the baseline manifest from that commit "
+                    "(https://diffcost.dev/docs/dbt#how-the-baseline-step-works)."
+                )
+        return kept[2]
+
+    def base_moved_paths(self) -> frozenset[str]:
+        """The paths the base changed after the PR's branch started (between `compare_base()`
+        and the base itself; empty when they are the same commit, as on GitHub's merge commit
+        and on a merge queue run). A file this PR changed too can't be priced from the PR's
+        own change: after the merge it holds both. Raises GitError like `compare_base`."""
+        found = self.compare_base()
+        if found == self.base_rev:
+            return frozenset()
+        workspace = self.workspace or "."
+        kept_base = self._compare_base
+        if kept_base is not None and kept_base[:3] == (workspace, self.base_rev, found):
+            base_sha = kept_base[3]
+        else:
+            base_sha = commit_sha(workspace, self.base_rev)
+        if found == base_sha:
+            return frozenset()
+        kept = self._base_moved
+        if kept is None or kept[:3] != (workspace, found, base_sha):
+            kept = self._base_moved = (
+                workspace, found, base_sha, frozenset(paths_changed_between(workspace, found, base_sha))
+            )
+        return kept[3]
 
     @property
     def base_label(self) -> str:
@@ -276,7 +338,7 @@ def load_config() -> ActionConfig:
 
     # Validate user-supplied paths to prevent path traversal
     for path_name, path_val in [("manifest_path", config.manifest_path), ("config_path", config.config_path)]:
-        if path_val and (".." in path_val or path_val.startswith("/")):
+        if path_val and (".." in PurePosixPath(path_val).parts or path_val.startswith("/")):
             config.config_error = f"`{path_name}` must be a relative path without `..` components (got {path_val[:80]!r})."
             config.manifest_path = "" if path_name == "manifest_path" else config.manifest_path
             config.config_path = ".diffcost.yml" if path_name == "config_path" else config.config_path
@@ -306,13 +368,16 @@ def load_config() -> ActionConfig:
 
     base_sha = "" if explicit_base_ref else str((pr.get("base") or {}).get("sha") or "")
     try:
-        config.resolved_base_ref = resolve_base_ref(workspace, config.base_ref, base_sha=base_sha)
+        merge_base_parent = ""
         if head_sha:
+            require_repository(workspace)  # "not a git checkout", not "the head commit is missing"
             merge_base_parent = check_checkout_matches_pr(workspace, head_sha)
-            # On GitHub's merge commit, diff against exactly the base it merged into
-            if merge_base_parent and not explicit_base_ref:
-                resolved = resolve_base_ref(workspace, "", base_sha=merge_base_parent)
-                config.resolved_base_ref = resolved
+        if merge_base_parent and not explicit_base_ref:
+            # On GitHub's merge commit, diff against exactly the base it merged into (the
+            # event's base commit isn't needed then: a re-run after a force-push may lack it)
+            config.resolved_base_ref = resolve_base_ref(workspace, "", base_sha=merge_base_parent)
+        else:
+            config.resolved_base_ref = resolve_base_ref(workspace, config.base_ref, base_sha=base_sha)
     except GitError as e:
         config.git_error = str(e)
         config.resolved_base_ref = ""
@@ -408,7 +473,7 @@ def _parse_threshold(config: ActionConfig, raw, key: str, maximum: float) -> flo
         return None
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: an integer beyond the float range
         _policy_warn(config, f".diffcost.yml thresholds.{key} must be a number (got {str(raw)[:40]!r}). Ignoring it.")
         return None
     if not (0 <= value <= maximum):
@@ -416,6 +481,19 @@ def _parse_threshold(config: ActionConfig, raw, key: str, maximum: float) -> flo
         return None
     # The backend stores and evaluates thresholds with 4 decimal places; match it
     return round(value, 4)
+
+
+def _parse_runs_per_month(raw) -> int | None:
+    """`default_runs_per_month` as an integer, or None when it isn't one: a whole number
+    (60, "60", 30.0), never a fraction, an infinity or a NaN."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, float) and not raw.is_integer():  # 30.9, inf and nan
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _load_diffcost_yml(config: ActionConfig) -> None:
@@ -474,11 +552,7 @@ def _load_diffcost_yml(config: ActionConfig) -> None:
         config.ignored_paths = [str(p) for p in ignored]
 
     if "default_runs_per_month" in raw:
-        runs = raw["default_runs_per_month"]
-        try:
-            runs_int = int(runs) if not isinstance(runs, bool) else None
-        except (TypeError, ValueError):
-            runs_int = None
+        runs_int = _parse_runs_per_month(raw["default_runs_per_month"])
         if runs_int is None or not (1 <= runs_int <= 100_000):
             _warn(f"{yml_path}: default_runs_per_month must be an integer between 1 and 100,000. Using {DEFAULT_RUNS_PER_MONTH}.")
         else:

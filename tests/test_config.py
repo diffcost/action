@@ -668,3 +668,113 @@ class TestPlainSqlDryRunOptions:
         config = self._load(checkout_repo, "thresholds:\n  absolute: 5\n")
         assert config.default_dataset == "" and config.query_parameters == []
         assert "::warning::" not in capsys.readouterr().out
+
+
+class TestBaseCommitAndComparison:
+    """The cost policy is read from the base commit; files are compared where the branch meets it."""
+
+    def _diverged(self, checkout_repo, base_files, pr_files, base_changes):
+        from tests.conftest import _git
+
+        repo = checkout_repo(base_files)
+        branch_point = repo.git("rev-parse", "HEAD").strip()
+        for path, content in pr_files.items():
+            repo.write(path, content)
+        repo.commit("pr")
+        head = repo.git("rev-parse", "HEAD").strip()
+        for path, content in base_changes.items():
+            (repo.upstream / path).write_text(content)
+        _git(repo.upstream, "add", "-A")
+        _git(repo.upstream, "commit", "-q", "-m", "base moves on")
+        repo.git("fetch", "-q", "origin")
+        return repo, branch_point, head, repo.git("rev-parse", "origin/main").strip()
+
+    def test_the_policy_comes_from_the_base_not_the_branch_point(self, checkout_repo, tmp_path):
+        """A PR author picks where the branch starts: an older policy there must not apply."""
+        repo, branch_point, head, tip = self._diverged(
+            checkout_repo,
+            {".diffcost.yml": "ignored_paths: ['**/*.sql']\n", "q.sql": "SELECT 1"},
+            {"q.sql": "SELECT 2"},
+            {".diffcost.yml": "thresholds:\n  absolute: 5\n"},
+        )
+        with patch.dict(os.environ, _env(str(repo.path), GITHUB_EVENT_PATH=_event(tmp_path, tip, head))):
+            config = load_config()
+        assert config.git_error == "" and config.resolved_base_ref == tip
+        assert config.thresholds.absolute_usd == 5.0 and config.ignored_paths == []
+        assert config.compare_base() == branch_point
+
+    def test_merge_commit_needs_only_its_own_parent(self, checkout_repo, tmp_path):
+        """A re-run's event may name a base commit the checkout lacks (force-pushed away): on
+        GitHub's merge commit the diff base is the merge commit's first parent, so that's enough."""
+        repo = checkout_repo({"a.sql": "SELECT 1"})
+        base = repo.git("rev-parse", "HEAD").strip()
+        repo.git("checkout", "-q", "-b", "feature")
+        repo.write("a.sql", "SELECT 2")
+        repo.commit("pr")
+        head = repo.git("rev-parse", "HEAD").strip()
+        repo.git("checkout", "-q", "--detach", base)
+        repo.git("-c", "user.name=t", "-c", "user.email=t@example.com", "merge", "-q", "--no-ff", "-m", "merge", "feature")
+        with patch.dict(os.environ, _env(str(repo.path), GITHUB_EVENT_PATH=_event(tmp_path, "e" * 40, head))):
+            config = load_config()
+        assert config.git_error == ""
+        assert config.resolved_base_ref == base
+        assert config.compare_base() == base
+
+    def test_head_checkout_still_needs_the_event_base(self, checkout_repo, tmp_path):
+        repo = checkout_repo({"a.sql": "SELECT 1"})
+        repo.write("a.sql", "SELECT 2")
+        repo.commit("pr")
+        head = repo.git("rev-parse", "HEAD").strip()
+        with patch.dict(os.environ, _env(str(repo.path), GITHUB_EVENT_PATH=_event(tmp_path, "e" * 40, head))):
+            config = load_config()
+        assert "base commit `eeeeeeeeeeee` is not in the checkout" in config.git_error
+        assert config.resolved_base_ref == ""
+
+    def test_not_a_git_checkout_says_so(self, tmp_path):
+        with patch.dict(os.environ, _env(str(tmp_path), GITHUB_EVENT_PATH=_event(tmp_path, "a" * 40, "b" * 40))):
+            config = load_config()
+        assert "Could not read the git repository" in config.git_error
+
+    def test_an_unresolved_base_is_the_git_error(self, tmp_path):
+        from gitutil import GitError
+
+        with patch.dict(os.environ, _env(str(tmp_path), INPUT_BASE_REF="main")):
+            config = load_config()
+        with pytest.raises(GitError):
+            config.compare_base()
+
+
+class TestPolicyValuesThatOverflow:
+    def _load(self, checkout_repo, yml):
+        repo = checkout_repo({".diffcost.yml": yml})
+        with patch.dict(os.environ, _env(str(repo.path))):
+            return load_config()
+
+    def test_an_integer_beyond_the_float_range_is_a_policy_warning(self, checkout_repo):
+        config = self._load(checkout_repo, "thresholds:\n  absolute: 1" + "0" * 400 + "\n  relative: 5\n")
+        assert config.thresholds.absolute_usd is None and config.thresholds.relative_pct == 5.0
+        assert any("thresholds.absolute must be a number" in w for w in config.policy_warnings)
+
+    @pytest.mark.parametrize("raw", [".inf", "-.inf", ".nan", "30.9", "1" + "0" * 400])
+    def test_runs_per_month_that_is_not_a_whole_number_uses_the_default(self, checkout_repo, capsys, raw):
+        config = self._load(checkout_repo, f"default_runs_per_month: {raw}\n")
+        assert config.default_runs_per_month == 30
+        assert "default_runs_per_month must be an integer" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("raw, expected", [("60", 60), ("'60'", 60), ("30.0", 30)])
+    def test_whole_runs_per_month_are_accepted(self, checkout_repo, raw, expected):
+        assert self._load(checkout_repo, f"default_runs_per_month: {raw}\n").default_runs_per_month == expected
+
+
+class TestPathInputs:
+    @pytest.mark.parametrize("path", ["releases/v1..2/manifest.json", "a/..b/manifest.json"])
+    def test_dots_inside_a_name_are_allowed(self, tmp_path, path):
+        with patch.dict(os.environ, _env(str(tmp_path), INPUT_MANIFEST_PATH=path)):
+            config = load_config()
+        assert config.config_error == "" and config.manifest_path == path
+
+    @pytest.mark.parametrize("path", ["../x.json", "a/../b.json", "a/.."])
+    def test_parent_directory_components_are_refused(self, tmp_path, path):
+        with patch.dict(os.environ, _env(str(tmp_path), INPUT_MANIFEST_PATH=path)):
+            config = load_config()
+        assert "relative path" in config.config_error and config.manifest_path == ""

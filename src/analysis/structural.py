@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import exp
@@ -66,16 +66,17 @@ def analyze_structural_changes(
       one that doesn't look like a partition filter gets its own finding: the dry run can't
       show what cluster pruning saved.
     Any other removed filter on a date-like column counts as a removed partition filter.
-    """
-    try:
-        prod_ast = sqlglot.parse_one(production_sql, dialect="bigquery")
-    except SqlglotError:
-        return [Finding("Could not parse production SQL", "low", "sqlglot parse error — skipping structural analysis", skipped=True)]
 
-    try:
-        pr_ast = sqlglot.parse_one(pr_sql, dialect="bigquery")
-    except SqlglotError:
-        return [Finding("Could not parse PR SQL", "low", "sqlglot parse error — skipping structural analysis", skipped=True)]
+    A file with several statements is compared as a whole: every statement's conditions,
+    tables, joins and stars count, whichever statement they are in (see _parse_statements).
+    """
+    prod_ast = _parse_statements(production_sql)
+    if isinstance(prod_ast, str):
+        return [Finding("Could not parse production SQL", "low", prod_ast, skipped=True)]
+
+    pr_ast = _parse_statements(pr_sql)
+    if isinstance(pr_ast, str):
+        return [Finding("Could not parse PR SQL", "low", pr_ast, skipped=True)]
 
     try:
         findings = _run_checks(prod_ast, pr_ast, partition_columns, cluster_columns)
@@ -83,6 +84,85 @@ def analyze_structural_changes(
         return [Finding("Structural analysis failed", "low", f"{type(e).__name__} — skipping structural analysis", skipped=True)]
 
     return findings
+
+
+class _Statements(exp.Expression):
+    """The statements of one SQL text that has several, as one tree: the checks walk a whole
+    tree, so they see every statement."""
+
+    arg_types = {"expressions": True}
+
+
+_PARSE_ERROR = "sqlglot parse error — skipping structural analysis"
+_NOTHING_TO_ANALYZE = (
+    "nothing to analyze (only statements the SQL parser keeps as plain text, such as DECLARE or CALL) "
+    "— skipping structural analysis"
+)
+# Script statements sqlglot keeps as text (`exp.Command`) end at the first `;`, so the one that
+# opens a block also holds the block's first statement: `BEGIN SELECT ...`, `IF c THEN SELECT ...`.
+# The text after these openers is parsed again. `None`: the whole text after the keyword.
+_BLOCK_OPENERS = {
+    "BEGIN": None,
+    "ELSE": None,
+    "IF": re.compile(r"\bTHEN\b", re.IGNORECASE),
+    "ELSEIF": re.compile(r"\bTHEN\b", re.IGNORECASE),
+    "EXCEPTION": re.compile(r"^\s*WHEN\s+ERROR\s+THEN\b", re.IGNORECASE),
+}
+
+
+def _parse_statements(sql: str) -> exp.Expression | str:
+    """Parse every statement of `sql`: the statement itself when there is one, a `_Statements`
+    node over all of them otherwise (they are never paired by position: a statement added in
+    front would shift every pair). When nothing can be analyzed, the reason instead (a
+    Finding detail): the text doesn't parse (a `WHILE`, `LOOP`, `REPEAT` or `CASE` statement
+    block among them), or it holds only statements sqlglot keeps as text. Such a block that is
+    the first statement of a block opener (see _BLOCK_OPENERS) is part of the opener's text:
+    it fails to parse there and is skipped, with the first statement of its body, while the
+    rest of the text is analyzed.
+
+    Left out: empty statements (a trailing `;`, a comment after it) and the ones sqlglot only
+    keeps as text (`exp.Command`: DECLARE, CALL, END), which nothing can be read from. A block
+    opener's text is parsed again (see _BLOCK_OPENERS), so the statements inside a
+    `BEGIN … END`, `IF … THEN` or `EXCEPTION WHEN ERROR THEN` block count, the first one
+    included.
+    """
+    try:
+        pending = list(sqlglot.parse(sql, dialect="bigquery"))
+    except (SqlglotError, RecursionError):  # sqlglot's parser recurses once per nested subquery
+        return _PARSE_ERROR
+    statements: list[exp.Expression] = []
+    script = False  # the text has script statements, which carry nothing to analyze
+    while pending:
+        statement = pending.pop(0)
+        if statement is None or isinstance(statement, exp.Semicolon):
+            continue
+        if not isinstance(statement, exp.Command):
+            statements.append(statement)
+            continue
+        script = True
+        inner = _block_text(statement)
+        if inner:
+            try:
+                pending[:0] = sqlglot.parse(inner, dialect="bigquery")
+            except Exception:  # never let a sqlglot edge case fail the run
+                pass  # e.g. an IF condition with its own THEN: that statement stays unread
+    if not statements:
+        return _NOTHING_TO_ANALYZE if script else _PARSE_ERROR
+    return statements[0] if len(statements) == 1 else _Statements(expressions=statements)
+
+
+def _block_text(command: exp.Command) -> str:
+    """The statement a block-opening script statement holds (see _BLOCK_OPENERS), or ""."""
+    keyword = str(command.this or "").upper()
+    if keyword not in _BLOCK_OPENERS:
+        return ""
+    text = command.expression  # a Literal or the plain text, depending on the keyword
+    text = text.this if isinstance(text, exp.Literal) else text if isinstance(text, str) else ""
+    marker = _BLOCK_OPENERS[keyword]
+    if marker is not None:
+        found = marker.search(text)
+        text = text[found.end():] if found else ""
+    return text.strip()
 
 
 def _run_checks(
@@ -469,8 +549,8 @@ def _is_partition_like(column: str, has_date_value: bool = True) -> bool:
 
 
 def _dedupe(findings: list[Finding]) -> list[Finding]:
-    """Drop duplicate findings. A removed partition filter already explains a WHERE-count drop,
-    and a new JOIN already reports the table it joins."""
+    """Drop duplicate findings. A removed partition filter already explains a query left
+    without WHERE conditions, and a new JOIN already reports the table it joins."""
     has_partition_removal = any(f.description.startswith("Partition filter removed") for f in findings)
     joined = {
         f.subject.lower().split(".")[-1]
@@ -480,9 +560,7 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     seen: set[tuple[str, str]] = set()
     result = []
     for f in findings:
-        if has_partition_removal and (
-            f.description == "All WHERE conditions removed" or f.description.endswith("WHERE condition(s) removed")
-        ):
+        if has_partition_removal and f.description == "All WHERE conditions removed":
             continue
         if f.description == "New table reference" and f.subject.lower().split(".")[-1] in joined:
             continue
@@ -495,12 +573,35 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
 
 
 def _check_select_star(prod: exp.Expression, pr: exp.Expression) -> list[Finding]:
-    """Detect SELECT * additions: a bare `*`, or a `t.*` for a table not starred before.
+    """Detect SELECT * additions: a table whose columns all reach the query's result through
+    `*` or `t.*` in the PR version and didn't in the production version (see _star_reach).
 
-    A bare `*` already in the production version covers any qualified star the PR adds.
-    """
-    prod_stars = _star_sources(prod)
-    added = set() if "" in prod_stars else _star_sources(pr) - prod_stars
+    So a star added inside a CTE or derived table counts when the result reads it through
+    another star (`WITH b AS (SELECT * FROM t) SELECT * FROM b`), whether or not the query had
+    a star before, and doesn't when the result takes named columns from it: BigQuery reads
+    the columns the result uses.
+
+    A star that ends at a CTE's or derived table's own column list passes on that list. When
+    the list reads more source columns than the production version's result does
+    (_list_columns, less the star's `EXCEPT`), each of the list's tables that the production
+    version's stars didn't reach counts on its own: `SELECT id, name FROM s` becoming
+    `SELECT * FROM s` reads every column `s` lists, while `SELECT id FROM t` becoming
+    `WITH s AS (SELECT id FROM t) SELECT * FROM s` reads nothing more.
+
+    A table the production version didn't read at all counts only when the PR also writes a
+    star the production version doesn't have: under an unchanged `*`, a swapped or newly
+    joined table is reported as a new table or JOIN, not as a star."""
+    prod_reach = _star_reach(prod)
+    pr_reach = _star_reach(pr)
+    added = pr_reach.tables - prod_reach.tables
+    width = _result_width(prod)
+    # What the production stars reached; each table of a list counts on its own
+    known = prod_reach.tables.union(*prod_reach.reached)
+    for tables, columns in pr_reach.lists:
+        if columns > width:
+            added |= tables - known
+    if added and not _star_sources(pr) - _star_sources(prod):
+        added &= _extract_table_names(prod)
 
     if added:
         return [
@@ -546,7 +647,11 @@ def _check_join_changes(prod: exp.Expression, pr: exp.Expression) -> list[Findin
 
 
 def _check_where_clause_changes(prod: exp.Expression, pr: exp.Expression) -> list[Finding]:
-    """Detect WHERE clause weakening (fewer predicates)."""
+    """Detect a query that lost every WHERE condition.
+
+    A query that keeps some conditions gets no count-based finding: each removed condition
+    already has its own (see _check_partition_filter_removal), and a count of distinct
+    condition texts also drops when nothing was removed (two bounds rewritten as one BETWEEN)."""
     prod_count = _count_where_predicates(prod)
     pr_count = _count_where_predicates(pr)
 
@@ -556,16 +661,6 @@ def _check_where_clause_changes(prod: exp.Expression, pr: exp.Expression) -> lis
                 "All WHERE conditions removed",
                 "high",
                 f"Production had {prod_count} filter condition(s). PR version has none.",
-            )
-        ]
-    elif prod_count > pr_count > 0:
-        diff = prod_count - pr_count
-        return [
-            Finding(
-                f"{diff} WHERE condition(s) removed",
-                "medium",
-                f"Production had {prod_count} conditions, PR has {pr_count}. "
-                "Fewer filters = more data scanned.",
             )
         ]
     return []
@@ -663,10 +758,19 @@ def _extract_where_predicates(ast: exp.Expression) -> set[str]:
 
 
 def _split_and_predicates(expr: exp.Expression) -> list[exp.Expression]:
-    """Split AND-connected predicates into individual conditions."""
-    if isinstance(expr, exp.And):
-        return _split_and_predicates(expr.left) + _split_and_predicates(expr.right)
-    return [expr]
+    """Split AND-connected predicates into individual conditions. A parenthesized group of
+    ANDs, `(a AND b)`, is split like `a AND b`; any other parenthesized condition, such as
+    `(a OR b)`, stays one condition as written."""
+    conditions: list[exp.Expression] = []
+    pending = [expr]  # an explicit stack: a long chain of ANDs is a deep tree
+    while pending:
+        node = pending.pop()
+        inner = _unwrap(node)
+        if isinstance(inner, exp.And):
+            pending.extend([inner.right, inner.left])  # the left one first
+        else:
+            conditions.append(node)
+    return conditions
 
 
 def _count_where_predicates(ast: exp.Expression) -> int:
@@ -707,26 +811,352 @@ def _extract_joins(ast: exp.Expression) -> set[tuple[str, str]]:
 
 
 def _extract_table_names(ast: exp.Expression) -> set[str]:
-    """Extract all table names from FROM and JOIN clauses, ignoring CTE aliases."""
+    """Extract all table names from FROM and JOIN clauses, ignoring references to CTEs. A
+    CTE is referenced by its bare name: `raw.orders` is a table even when a CTE is named
+    `orders` (an import CTE is often named after the table it reads)."""
     cte_names = {cte.alias_or_name.lower() for cte in ast.find_all(exp.CTE) if cte.alias_or_name}
     tables = set()
     for table in ast.find_all(exp.Table):
-        if table.name.lower() in cte_names:
+        if not table.db and not table.catalog and table.name.lower() in cte_names:
             continue
-        parts = [p for p in [table.catalog, table.db, table.name] if p]
-        if parts:
-            tables.add(".".join(parts))
+        name = _table_name(table)
+        if name:
+            tables.add(name)
     return tables
 
 
+def _table_name(table: exp.Table) -> str:
+    """`project.dataset.table`, with the parts the query wrote. A table function is named by
+    its function (`p.d.tvf`, `ML.PREDICT`): sqlglot gives it no table name."""
+    name = table.name
+    if isinstance(table.this, exp.Func):
+        name = table.this.name if isinstance(table.this, exp.Anonymous) else table.this.sql_name()
+    return ".".join(p for p in [table.catalog, table.db, name] if p)
+
+
+def _result_selects(node: exp.Expression | None) -> list[exp.Select]:
+    """The SELECTs whose lists make up what `node` returns or stores: the query itself, every
+    branch of a set operation, the query of a CREATE ... AS, an INSERT or a MERGE's USING, and
+    those of each statement of a multi-statement text. Empty for anything else. Walked with an
+    explicit stack: sqlglot nests a long UNION ALL one level per branch."""
+    selects: list[exp.Select] = []
+    pending = [node]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, exp.Select):
+            selects.append(node)
+        elif isinstance(node, _Statements):
+            pending.extend(node.expressions)
+        elif isinstance(node, exp.SetOperation):
+            pending.extend([node.this, node.expression])
+        elif isinstance(node, exp.Subquery):
+            pending.append(node.this)
+        elif isinstance(node, (exp.Create, exp.Insert)):
+            pending.append(node.expression)
+        elif isinstance(node, exp.Merge):
+            pending.append(node.args.get("using"))
+    return selects
+
+
+def _select_sources(select: exp.Select) -> list[exp.Expression]:
+    """The tables (CTE references included) and derived tables a SELECT reads directly: its
+    FROM and JOINs, and the members of a parenthesized join. UNNEST and other sources that
+    aren't a table or a subquery are left out."""
+    sources: list[exp.Expression] = []
+    pending = [select.args.get("from"), *(select.args.get("joins") or [])]
+    while pending:
+        item = pending.pop(0)
+        node = item.this if isinstance(item, (exp.From, exp.Join)) else item
+        if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Table):
+            node = node.this  # (a JOIN b): the table, with the join hanging off it
+        if isinstance(node, exp.Table):
+            sources.append(node)
+            pending.extend(node.args.get("joins") or [])
+        elif isinstance(node, exp.Subquery):
+            sources.append(node)
+    return sources
+
+
+def _referenced_cte(table: exp.Table) -> exp.CTE | None:
+    """The CTE a bare table name refers to, looked up from where the name is written: the
+    nearest enclosing WITH that defines it. A CTE's own name inside its definition is the
+    table of that name unless the WITH is recursive."""
+    if table.db or table.catalog or not table.name:
+        return None
+    name = table.name.lower()
+    own = None  # the CTE whose definition holds the name, at the WITH being looked at
+    node = table.parent
+    while node is not None:
+        if isinstance(node, exp.CTE):
+            own = node
+        with_ = node.args.get("with")
+        if isinstance(with_, exp.With):
+            for cte in with_.expressions:
+                if (cte.alias_or_name or "").lower() == name and (cte is not own or with_.args.get("recursive")):
+                    return cte
+        node = node.parent
+    return None
+
+
+def _other_source_names(select: exp.Select) -> set[str]:
+    """The names a SELECT gives its sources that aren't tables or subqueries (`UNNEST(x) AS e`,
+    `t.arr AS e`): what `e.*` or a bare `e` refers to there reads no table's row."""
+    names = set()
+    pending = [select.args.get("from"), *(select.args.get("joins") or [])]
+    while pending:  # the same walk as _select_sources, parenthesized joins included
+        item = pending.pop(0)
+        node = item.this if isinstance(item, (exp.From, exp.Join)) else item
+        if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Table):
+            node = node.this
+        if isinstance(node, exp.Table):
+            pending.extend(node.args.get("joins") or [])
+        elif isinstance(node, exp.Unnest):
+            alias = node.args.get("alias")
+            names.update(c.name.lower() for c in (alias.columns if alias is not None else []))
+            if node.alias:
+                names.add(node.alias.lower())
+    return names
+
+
+@dataclass
+class _StarReach:
+    """What reaches a query's result through stars (see _star_reach)."""
+
+    tables: set[str] = field(default_factory=set)  # read in full
+    # The tables under each SELECT a star reached, below the result's own SELECTs
+    reached: list[frozenset[str]] = field(default_factory=list)
+    # A star that ended at a column list: the tables under that SELECT, and its width
+    lists: list[tuple[frozenset[str], int]] = field(default_factory=list)
+
+
+def _source_selects(source: exp.Expression) -> list[exp.Select] | None:
+    """The SELECTs a source's rows come from: a derived table's, or the referenced CTE's.
+    None for a table."""
+    if isinstance(source, exp.Subquery):
+        return _result_selects(source)
+    cte = _referenced_cte(source)
+    return _result_selects(cte.this) if cte is not None else None
+
+
+def _tables_under(select: exp.Select) -> frozenset[str]:
+    """The tables a SELECT reads from, through its CTEs and derived tables (FROM and JOINs)."""
+    tables: set[str] = set()
+    seen: set[int] = set()
+    pending = [select]
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for source in _select_sources(node):
+            inner = _source_selects(source)
+            if inner is not None:
+                pending.extend(inner)
+            elif _table_name(source):
+                tables.add(_table_name(source))
+    return frozenset(tables)
+
+
+def _projection_queries(expr: exp.Expression) -> list[exp.Select]:
+    """The SELECTs a SELECT-list entry holds (`ARRAY(SELECT AS STRUCT * ...)`, a scalar
+    subquery): their rows are part of the result. Not those under EXISTS or IN, which only test."""
+    found: list[exp.Select] = []
+    pending = [expr]
+    while pending:
+        node = pending.pop()
+        if node is not expr and isinstance(node, (exp.Select, exp.Subquery, exp.SetOperation)):
+            found.extend(_result_selects(node))
+            continue
+        if isinstance(node, (exp.Exists, exp.In)):
+            continue
+        pending.extend(node.iter_expressions())
+    return found
+
+
+def _sources_by_name(select: exp.Select) -> dict[str, list[exp.Expression]]:
+    """A SELECT's sources (_select_sources) by the lowercased name the query uses for them: the
+    alias or table name, and the alias of a PIVOT / UNPIVOT applied to them."""
+    by_name: dict[str, list[exp.Expression]] = {}
+    for source in _select_sources(select):
+        by_name.setdefault((source.alias_or_name or "").lower(), []).append(source)
+        for pivot in source.args.get("pivots") or []:
+            if pivot.alias:
+                by_name.setdefault(pivot.alias.lower(), []).append(source)
+    return by_name
+
+
+def _star_except(star: exp.Expression) -> frozenset[str]:
+    """The columns a `* EXCEPT (…)` or `t.* EXCEPT (…)` leaves out (lowercased)."""
+    node = star.this if isinstance(star, exp.Column) else star
+    return frozenset(c.name.lower() for c in (node.args.get("except") or []) if isinstance(c, exp.Column))
+
+
+def _column_key(column: exp.Column) -> tuple[str, str]:
+    """A column as (qualifier, name), lowercased: `a.id` and `b.id` are two columns."""
+    return (column.table or "").lower(), column.name.lower()
+
+
+def _join_columns(select: exp.Select) -> set[tuple[str, str]]:
+    """The columns a SELECT's join conditions read (`ON`, and `USING` columns unqualified),
+    parenthesized joins included."""
+    columns: set[tuple[str, str]] = set()
+    joins = list(select.args.get("joins") or [])
+    for source in _select_sources(select):
+        joins.extend(source.args.get("joins") or [])
+    for join in joins:
+        on = join.args.get("on")
+        if on is not None:
+            columns.update(_column_key(c) for c in _outer_columns(on) if not c.is_star)
+        for column in join.args.get("using") or []:
+            columns.add(("", column.name.lower()))
+    return columns
+
+
+def _list_columns(select: exp.Select, left_out: frozenset[str] = frozenset()) -> set[tuple[str, str]]:
+    """How wide a SELECT is, as the source columns (qualifier, name) its entries and its join
+    conditions read: a constant or `CURRENT_TIMESTAMP()` reads none, `amount * 100 AS cents`
+    reads `amount`, `a.id` and `b.id` are two. A struct column's `s.*` counts as the column
+    `s`, an UNNEST alias's `e.*` as nothing, a star over a source as nothing (what it reaches
+    is followed instead). Entries whose output name is in `left_out` (the `EXCEPT` of the
+    stars that read this list) don't count."""
+    sources = _sources_by_name(select)
+    unread = _other_source_names(select)
+    columns: set[tuple[str, str]] = set()
+    for expr in select.expressions:
+        if isinstance(expr, exp.Star):
+            continue
+        if isinstance(expr, exp.Column) and expr.is_star:
+            qualifier = (expr.table or "").lower()
+            if qualifier and qualifier not in sources and qualifier not in unread:
+                columns.add((qualifier, ""))
+            continue
+        if (expr.alias_or_name or "").lower() in left_out:
+            continue
+        columns.update(_column_key(c) for c in _outer_columns(expr) if not c.is_star)
+    return columns | _join_columns(select)
+
+
+def _result_width(ast: exp.Expression) -> int:
+    """How wide the query's own result is (_list_columns of its outermost SELECT: for a set
+    operation its first SELECT, for a CREATE ... AS or an INSERT the query it stores, for a
+    MERGE its USING), summed over the statements of a multi-statement text."""
+    if isinstance(ast, _Statements):
+        return sum(_result_width(statement) for statement in ast.expressions)
+    node: exp.Expression | None = ast
+    while node is not None and not isinstance(node, exp.Select):
+        if isinstance(node, (exp.SetOperation, exp.Subquery)):
+            node = node.this
+        elif isinstance(node, (exp.Create, exp.Insert)):
+            node = node.expression
+        elif isinstance(node, exp.Merge):
+            node = node.args.get("using")
+        else:
+            return 0
+    return len(_list_columns(node)) if node is not None else 0
+
+
+def _struct_rows(qualifier: str, sources: list[exp.Expression]) -> list[exp.Expression]:
+    """The sources whose whole row a struct column `qualifier` holds, for `qualifier.*` where
+    `qualifier` names no source: a derived table's or CTE's SELECT-list entry of that name,
+    built from a source's row (`ARRAY_AGG(original ...)[OFFSET(0)] AS unique`). A table's own
+    struct column, or one passed on by a `*`, reads only that column."""
+    rows: list[exp.Expression] = []
+    for source in sources:
+        for select in _source_selects(source) or []:
+            by_name = _sources_by_name(select)
+            for expr in select.expressions:
+                if (expr.alias_or_name or "").lower() != qualifier:
+                    continue
+                for column in _outer_columns(expr):
+                    name = column.name.lower()
+                    if not column.table and not column.is_star and name in by_name:
+                        rows.extend(by_name[name])
+    return rows
+
+
+def _star_reach(ast: exp.Expression) -> _StarReach:
+    """The tables whose every column reaches the query's result: walked from the result's
+    SELECT lists (_result_selects, and the SELECTs inside a SELECT-list entry) to the sources
+    each one reads in full, and on through CTEs and derived tables, to the tables. A SELECT
+    reads a source in full through a bare `*` (every source), a `t.*` (the source named `t`),
+    or the source's name used as a value: a bare `t` or an argument such as
+    `TO_JSON_STRING(t)` or `ARRAY_AGG(t ...)` is the whole row, as in BigQuery, where a
+    source's name wins over a column of the same name. A `s.*` whose `s` names no source is a
+    struct column's fields: only a struct built from a source's row reads that row
+    (_struct_rows). A SELECT list of named columns ends the walk (recorded in `lists`, as wide
+    as the source columns it reads, less the `EXCEPT` of the star that reached it): BigQuery
+    reads only the columns the result uses. A `*` anywhere else (an EXISTS or IN subquery)
+    isn't followed, nor one in a SELECT-list subquery of a SELECT the walk doesn't reach. A
+    table function counts as a table, named by its function. A PIVOT's alias names the
+    source it pivots, and a table a PIVOT or UNPIVOT reads directly is read in full wherever
+    it is (BigQuery groups by every input column it doesn't aggregate or pivot)."""
+    reach = _StarReach()
+    for table in ast.find_all(exp.Table):
+        if table.args.get("pivots") and _referenced_cte(table) is None and _table_name(table):
+            reach.tables.add(_table_name(table))
+    # SELECTs reached through a star: the columns every star that reached it leaves out
+    below: dict[int, frozenset[str]] = {}
+    lists: list[tuple[exp.Select, frozenset[str]]] = []  # measured once every star is known
+    seen: set[int] = set()  # SELECTs already walked (a recursive CTE reads itself)
+    pending = _result_selects(ast)
+    while pending:
+        select = pending.pop()
+        if id(select) in seen:
+            continue
+        seen.add(id(select))
+        sources = _select_sources(select)
+        by_name = _sources_by_name(select)
+        unread = _other_source_names(select)
+        starred: list[tuple[exp.Expression, frozenset[str]]] = []  # each with its star's EXCEPT
+        for expr in select.expressions:
+            if isinstance(expr, exp.Star):
+                starred.extend((source, _star_except(expr)) for source in sources)
+                continue
+            if isinstance(expr, exp.Column) and expr.is_star:
+                qualifier = (expr.table or "").lower()
+                if qualifier in by_name:
+                    starred.extend((source, _star_except(expr)) for source in by_name[qualifier])
+                elif qualifier not in unread:
+                    starred.extend((source, frozenset()) for source in _struct_rows(qualifier, sources))
+                continue
+            for column in _outer_columns(expr):
+                name = column.name.lower()
+                if not column.table and not column.is_star and name in by_name:
+                    starred.extend((source, frozenset()) for source in by_name[name])
+            pending.extend(_projection_queries(expr))
+        if id(select) in below:
+            tables = _tables_under(select)
+            if tables:
+                reach.reached.append(tables)
+                if not starred:
+                    lists.append((select, tables))
+        for source, left_out in starred:
+            inner = _source_selects(source)
+            if inner is not None:
+                for s in inner:
+                    below[id(s)] = below[id(s)] & left_out if id(s) in below else left_out
+                pending.extend(inner)
+            elif _table_name(source):
+                reach.tables.add(_table_name(source))
+    reach.lists = [(tables, len(_list_columns(select, below[id(select)]))) for select, tables in lists]
+    return reach
+
+
 def _count_select_columns(ast: exp.Expression) -> int:
-    """Count columns in the outermost SELECT."""
-    if isinstance(ast, exp.Select):
-        return len(ast.expressions)
-    selects = list(ast.find_all(exp.Select))
-    if selects:
-        return len(selects[-1].expressions)
-    return 0
+    """Count the columns of the query's own SELECT list: for a set operation its first SELECT
+    (whose columns name the result), for a CREATE ... AS or an INSERT the query it stores, and
+    never a subquery's. Summed over the statements of a multi-statement text."""
+    if isinstance(ast, _Statements):
+        return sum(_count_select_columns(statement) for statement in ast.expressions)
+    node: exp.Expression | None = ast
+    while node is not None and not isinstance(node, exp.Select):
+        if isinstance(node, (exp.SetOperation, exp.Subquery)):
+            node = node.this
+        elif isinstance(node, (exp.Create, exp.Insert)):
+            node = node.expression
+        else:
+            return 0
+    return len(node.expressions) if node is not None else 0
 
 
 def _truncate(text: str, max_len: int) -> str:

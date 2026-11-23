@@ -449,6 +449,33 @@ class TestQueryParameters:
         assert result["unbound_parameters"] == [("?", ""), ("Label", "INT64"), ("run_date", "DATE"), ("x", "")]
 
     def test_positional_parameter_is_unbound(self):
+        """BigQuery refuses a positional `?` in a dry run, with or without named parameters."""
+        client = MagicMock()
+        client.query.side_effect = [
+            self._job(1),
+            Exception(
+                "400 POST https://bigquery.googleapis.com/bigquery/v2/projects/p/jobs?prettyPrint=false: "
+                "Positional parameters are not supported at [1:8]"
+            ),
+        ]
+        result = dry_run_pair(client, "SELECT 1", "SELECT ? AS n")
+        assess(result, {})
+        assert result["unknown_reason"] == "the PR version uses query parameters that have no value: ?"
+        assert result["cost_after"] is None and result["error"] is None
+
+    @pytest.mark.parametrize("message", [
+        "Positional parameters are not supported at [1:46]",
+        "Cannot mix named and positional parameters in scripts at [1:1]",
+    ])
+    def test_positional_parameter_errors_are_unbound_not_errors(self, message):
+        client = MagicMock()
+        client.query.side_effect = Exception(f"400 POST https://bigquery.googleapis.com/bigquery/v2/projects/p/jobs: {message}")
+        result = dry_run(client, "SELECT @a, ? AS m", query_parameters=[self._param("run_date", "DATE", "2026-11-13")])
+        assert result["error"] is None and result["bytes_processed"] is None
+        assert result["unbound_parameters"] == [("?", "")]
+
+    def test_unnamed_undeclared_parameter_is_unbound(self):
+        """An entry without a name in the dry run's statistics still counts as unbound."""
         client = MagicMock()
         client.query.side_effect = [self._job(1), self._job(0, [{"parameterType": {"type": "INT64"}}])]
         result = dry_run_pair(client, "SELECT 1", "SELECT ? AS n")

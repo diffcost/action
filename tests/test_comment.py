@@ -657,6 +657,96 @@ class TestVerdictAndEscaping:
         assert "No significant cost change" not in body
         assert "+$10.00/run" in body and "offset" in body
 
+    def test_editions_scan_from_zero_bytes_shows_the_scan_not_a_multiplier(self):
+        row = self._row(before=0.0, after=3.0, bytes_before=0, bytes_after=500 * 2**30)
+        body = self._body([row], bq_pricing_model="editions", total_before=0.0, total_after=3.0, total_delta=3.0)
+        assert "| +500.00 GiB from 0 B [Editions - Slot Based] |" in body
+
+    def test_editions_unchanged_zero_byte_scan_shows_no_change(self):
+        row = self._row(before=0.0, after=0.0, bytes_before=0, bytes_after=0)
+        body = self._body([row], bq_pricing_model="editions", total_before=0.0, total_after=0.0, total_delta=0.0)
+        assert "| [Editions - Slot Based] |" in body and "from 0 B" not in body
+
+    def test_editions_not_costed_row_shows_the_base_scan(self):
+        row = self._row(after=None, bytes_before=3 * 2**30, bytes_after=None, pr_depends_on_new_objects=True)
+        row["cost"] = {"status": "not_costed", "cost_before": 1.0, "cost_after": None, "delta": None,
+                       "pct": None, "reason": "depends on objects this PR creates", "blocking": False}
+        body = self._body([row], bq_pricing_model="editions", items_not_costed=1, total_delta=0.0)
+        assert "| `q` | 3.00 GiB | — | — | ⏳ Not costed" in body
+
+    def test_editions_not_costed_upper_bound_keeps_its_mark_and_note(self):
+        row = self._row(after=None, bytes_before=3 * 2**30, bytes_after=None, upper_bound_before=True,
+                        pr_depends_on_new_objects=True)
+        row["cost"] = {"status": "not_costed", "cost_before": 1.0, "cost_after": None, "delta": None,
+                       "pct": None, "reason": "depends on objects this PR creates", "blocking": False}
+        body = self._body([row], bq_pricing_model="editions", items_not_costed=1, total_delta=0.0)
+        assert "| `q` | ≤3.00 GiB | — |" in body and "marks an upper bound" in body
+
+    def test_editions_offsetting_savings_are_not_a_green_check(self):
+        """One query scans 5 TiB more, another 6 TiB less: thresholds still see the increase."""
+        tib = 2**40
+        rows = [self._row("a", 1.0, 32.25, bytes_before=tib, bytes_after=6 * tib),
+                self._row("b", 37.5, 0.0, bytes_before=6 * tib, bytes_after=0)]
+        body = self._body(rows, bq_pricing_model="editions", total_before=38.5, total_after=32.25, total_delta=-6.25,
+                          worst_query={"name": "a", "delta": 31.25, "pct": 3125.0})
+        assert "reduces" not in body and "✅" not in body.split("| **TOTAL**")[1].split("\n\n")[1]
+        assert ("⚠️ `a` scans **+5.00 TiB** more per run; savings in other queries offset it "
+                "(net -1.00 TiB, Editions slot-based pricing).") in body
+
+    def test_editions_any_scan_rise_offset_by_savings_is_named(self):
+        """Editions verdicts are about bytes: a rise worth less than half a cent still counts."""
+        rows = [self._row("a", 0.0001, 0.0002, bytes_before=2**20, bytes_after=2 * 2**20),
+                self._row("b", 6.25, 0.0, bytes_before=2**40, bytes_after=0)]
+        body = self._body(rows, bq_pricing_model="editions", total_before=6.2501, total_after=0.0002,
+                          total_delta=-6.2499)
+        assert "⚠️ `a` scans **+1.0 MiB** more per run; savings in other queries offset it" in body
+        assert "reduces" not in body
+
+    def test_editions_savings_with_no_query_increase_are_a_reduction(self):
+        tib = 2**40
+        rows = [self._row("a", 6.25, 6.25, bytes_before=tib, bytes_after=tib),
+                self._row("b", 37.5, 0.0, bytes_before=6 * tib, bytes_after=0)]
+        body = self._body(rows, bq_pricing_model="editions", total_before=43.75, total_after=6.25, total_delta=-37.5)
+        assert "✅ This PR **reduces** query scan volume by **6.00 TiB**" in body
+
+    @pytest.mark.parametrize("model", ["on_demand", "editions"])
+    def test_a_blocked_pr_never_gets_a_green_summary(self, model):
+        """A relative threshold on a small rise (or an unknown cost) exceeds the policy while the
+        costed total falls: the summary says so instead of a ✅."""
+        rows = [self._row("a", 0.001, 0.004, bytes_before=2**30, bytes_after=2**30),
+                self._row("b", 1.0, 0.0, bytes_before=2**40, bytes_after=0)]
+        body = self._body(rows, bq_pricing_model=model, total_before=1.001, total_after=0.004, total_delta=-0.997,
+                          blocked=True, block_reasons=["a: +300% exceeds the 100% per-query threshold"],
+                          worst_query={"name": "a", "delta": 0.003, "pct": 300.0})
+        assert "🚫 **Merge blocked**" in body
+        assert "✅" not in body and "**reduces**" not in body
+        if model == "editions":
+            assert ("ℹ️ The costed queries scan **1.00 TiB** less per run in total (Editions slot-based pricing), "
+                    "but the cost policy is exceeded (see above).") in body
+        else:
+            assert "ℹ️ The costed queries cost **$0.997/run** less in total (" in body
+            assert "), but the cost policy is exceeded (see above)." in body
+
+    @pytest.mark.parametrize("model", ["on_demand", "editions"])
+    def test_a_blocked_pr_with_no_cost_change_is_not_a_green_check(self, model):
+        row = self._row("a", 1.0, 1.0, bytes_before=2**30, bytes_after=2**30)
+        unknown = self._row("u", error="Access Denied")
+        body = self._body([row, unknown], bq_pricing_model=model, total_before=1.0, total_after=1.0, total_delta=0.0,
+                          blocked=True, block_reasons=["u: cost unknown"])
+        assert "✅" not in body
+        assert "but the cost policy is exceeded (see above)" in body
+
+    def test_a_blocked_structural_only_report_is_not_a_green_check(self):
+        row = {"name": "q", "path": "q.sql", "dry_run": None, "structural_findings": [],
+               "cost": {"status": "structural", "reason": ""}}
+        body = self._body([row], has_bq_creds=False, total_before=0, total_after=0, total_delta=0,
+                          blocked=True, block_reasons=["1 query could not be costed"])
+        assert "🚫 **Merge blocked**" in body and "✅" not in body
+        assert ("ℹ️ No structural cost risks detected in changed SQL files, but the cost policy is exceeded "
+                "(see above).") in body
+        unblocked = self._body([row], has_bq_creds=False, total_before=0, total_after=0, total_delta=0)
+        assert "✅ No structural cost risks detected in changed SQL files." in unblocked
+
     def test_not_costed_row_and_note(self):
         row = self._row(after=None, pr_depends_on_new_objects=True)
         row["cost"] = {"status": "not_costed", "cost_before": 1.0, "cost_after": None, "delta": None,

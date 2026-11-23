@@ -25,6 +25,12 @@ _UNRECOGNIZED_NAME_RE = re.compile(r"unrecognized name:", re.IGNORECASE)
 # "Query parameter 'run_date' not found at [1:40]": the query uses a named parameter that the
 # job doesn't set, while it sets others (with none set, BigQuery binds every one as NULL)
 _MISSING_PARAMETER_RE = re.compile(r"query parameter '([A-Za-z_][A-Za-z0-9_]*)' not found", re.IGNORECASE)
+# A positional `?` parameter: BigQuery refuses it in a dry run ("Positional parameters are not
+# supported at [1:8]"), and with named ones in the same query ("Cannot mix named and
+# positional parameters in scripts")
+_POSITIONAL_PARAMETER_RE = re.compile(
+    r"positional parameters are not supported|cannot mix named and positional parameters", re.IGNORECASE
+)
 
 
 def _container_credentials_path(path: str) -> str:
@@ -116,8 +122,8 @@ def _job_statistics(job) -> tuple[dict, dict]:
 def _undeclared_parameters(query_stats: dict) -> list[tuple[str, str]]:
     """(name, type) of the parameters a dry run found no value for
     (`undeclaredQueryParameters`, with the type BigQuery inferred), sorted by name. An entry
-    without a usable name (a positional `?` parameter, or one this code can't read) is "?",
-    and an unreadable type is "": either way the version is never priced."""
+    without a usable name is "?" and an unreadable type is "": either way the version is
+    never priced. (A positional `?` parameter never gets here: BigQuery fails its dry run.)"""
     found = query_stats.get("undeclaredQueryParameters")
     if not found:
         return []
@@ -143,11 +149,12 @@ def dry_run(client: bigquery.Client, sql: str, default_dataset: str = "", query_
     row access policies, for which BigQuery returns no byte estimate (bytes_processed None).
 
     `default_dataset` ("project.dataset") and `query_parameters` (config.QueryParameter) are
-    set on the job when given. `unbound_parameters` lists the (name, type) of named
-    parameters the query uses without a value: with no parameters set, BigQuery binds them
-    as NULL and still returns an estimate (often 0 bytes, because `= NULL` matches nothing),
-    so that estimate can't be trusted; with some set, a missing one fails the dry run, and
-    is reported here instead of as an error (type "", which BigQuery doesn't name then).
+    set on the job when given. `unbound_parameters` lists the (name, type) of the
+    parameters the query uses without a value: with no parameters set, BigQuery binds named
+    ones as NULL and still returns an estimate (often 0 bytes, because `= NULL` matches
+    nothing), so that estimate can't be trusted; with some set, a missing named one fails
+    the dry run, and a positional `?` always does: both are reported here instead of as an
+    error (type "", which BigQuery doesn't name then; a positional one is named "?").
     """
     if not sql or not sql.strip():
         return {"error": "Empty SQL"}
@@ -200,14 +207,15 @@ def dry_run(client: bigquery.Client, sql: str, default_dataset: str = "", query_
         }
     except Exception as e:
         missing_parameter = _MISSING_PARAMETER_RE.search(str(e))
-        if missing_parameter:
+        positional = _POSITIONAL_PARAMETER_RE.search(str(e))
+        if missing_parameter or positional:
             return {
                 "bytes_processed": None,
                 "referenced_tables": [],
                 "unmaterialized_upstream": False,
                 "unrecognized_name": False,
                 "error": None,
-                "unbound_parameters": [(missing_parameter.group(1), "")],
+                "unbound_parameters": [(missing_parameter.group(1) if missing_parameter else "?", "")],
             }
         if _is_unmaterialized(e):
             return {
@@ -256,8 +264,8 @@ def dry_run_pair(
     Per side (`_before` / `_after`): `accuracy` and `statement_type` from BigQuery, the
     referenced tables (`tables_before` / `tables_after`; in memory only, never sent), and
     `rls_before` / `rls_after` when that side reads a table with row-level security (no byte
-    estimate). `unbound_parameters_before` / `unbound_parameters_after`: the named parameters
-    that version uses without a value. accuracy.assess turns those into `unknown_reason`.
+    estimate). `unbound_parameters_before` / `unbound_parameters_after`: the parameters
+    that version uses without a value (named, or `?` for a positional one). accuracy.assess turns those into `unknown_reason`.
 
     `default_dataset` and `query_parameters` apply to both versions (see `dry_run`).
     """

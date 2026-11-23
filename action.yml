@@ -36,7 +36,7 @@ inputs:
     required: false
     default: '.diffcost.yml'
   base_ref:
-    description: 'Base branch to compare against: a branch name, a refs/heads/ or refs/remotes/ ref, or a full commit SHA (never a tag). Default: the event''s base commit (a pull request''s base commit, or a merge queue commit''s parent; else GITHUB_BASE_REF, resolved as refs/remotes/origin/<branch>). Requires `fetch-depth: 0` on actions/checkout.'
+    description: 'Base branch: the cost policy is read from it, and the PR is compared where its branch meets it. A branch name, a refs/heads/ or refs/remotes/ ref, or a full commit SHA (never a tag). Default: the event''s base commit (a pull request''s base commit, or a merge queue commit''s parent; else GITHUB_BASE_REF, resolved as refs/remotes/origin/<branch>). Requires `fetch-depth: 0` on actions/checkout.'
     required: false
     default: ''
   cost_per_tb:
@@ -84,7 +84,7 @@ outputs:
   total_bytes_after:
     description: 'Total BigQuery bytes scanned per run by the PR queries'
   scan_multiplier:
-    description: 'Ratio of PR scan volume to base scan volume (e.g. 4.20)'
+    description: 'Ratio of PR scan volume to base scan volume (e.g. 4.20); 1.00 when the base versions scan 0 B in total'
 
 runs:
   using: 'docker'

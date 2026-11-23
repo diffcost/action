@@ -58,13 +58,26 @@ def _rev_parse(workspace: str, rev: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def commit_sha(workspace: str, rev: str) -> str:
+    """`rev` as a commit SHA, or "" if it does not name a commit."""
+    return _rev_parse(workspace, rev)
+
+
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # Full refs accepted as an explicit `base_ref` (never tags or other refs)
 _BRANCH_REF_PREFIXES = ("refs/heads/", "refs/remotes/")
 
 
+def require_repository(workspace: str) -> None:
+    """Raise GitError unless `workspace` is a git checkout this user may read."""
+    probe = run_git(workspace, ["rev-parse", "--git-dir"], timeout=10)
+    if probe.returncode != 0:
+        raise GitError(f"Could not read the git repository: {explain_git_failure(probe.stderr)}")
+
+
 def resolve_base_ref(workspace: str, base_ref: str, base_sha: str = "", merge_group: bool = False) -> str:
-    """Resolve the diff base to a commit SHA.
+    """Resolve the base to a commit SHA: the commit the cost policy and the dbt project
+    layout are read from, and whose merge base with HEAD the files are compared with.
 
     `base_sha` (the PR event's `pull_request.base.sha`, or a merge queue event's
     `merge_group.base_sha`; `merge_group` words the error for it) wins when given: it is
@@ -76,9 +89,7 @@ def resolve_base_ref(workspace: str, base_ref: str, base_sha: str = "", merge_gr
     on a pull_request event stores branches only as `origin/<name>`, so a bare
     `main` does not resolve locally.
     """
-    probe = run_git(workspace, ["rev-parse", "--git-dir"], timeout=10)
-    if probe.returncode != 0:
-        raise GitError(f"Could not read the git repository: {explain_git_failure(probe.stderr)}")
+    require_repository(workspace)
 
     if base_sha:
         resolved = _rev_parse(workspace, base_sha)
@@ -112,6 +123,41 @@ def resolve_base_ref(workspace: str, base_ref: str, base_sha: str = "", merge_gr
         f"Base branch `{base_ref}` was not found (tried {', '.join(f'`{c}`' for c in candidates)}). "
         "Set `fetch-depth: 0` on `actions/checkout`, or set the `base_ref` input."
     )
+
+
+def merge_base(workspace: str, base_rev: str) -> str:
+    """The last commit HEAD's history shares with `base_rev` (`git merge-base`), as a SHA.
+
+    This is the commit a pull request's files are compared with: what the branch started
+    from, so commits the base gained since are never read as the PR's own changes. When
+    HEAD is GitHub's merge commit of the PR, or a merge queue commit, it is the base itself.
+    Raises GitError when the two share no commit in the checkout (a shallow clone, or
+    unrelated histories) or `base_rev` isn't in it: never "no changes".
+    """
+    result = run_git(workspace, ["merge-base", base_rev, "HEAD"], timeout=30)
+    found = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+    if result.returncode == 0 and found:
+        return found
+    if (result.stderr or "").strip():
+        detail = explain_git_failure(result.stderr)
+        if " — " not in detail:  # git's text matched no known cause: most often a commit not fetched
+            detail += " — the base branch history is missing. Set `fetch-depth: 0` on `actions/checkout`."
+        raise GitError(f"Could not compare with `{base_rev}`: {detail}")
+    # Exit 1 without a message: no common ancestor among the commits that were fetched
+    raise GitError(
+        f"Could not compare with `{base_rev}`: this branch shares no commit with it in the checkout — "
+        "the base branch history is missing. Set `fetch-depth: 0` on `actions/checkout`."
+    )
+
+
+def paths_changed_between(workspace: str, old: str, new: str) -> set[str]:
+    """Every path that differs between two commits (a rename counts as both of its paths).
+    Raises GitError when git can't diff them, never an empty set in its place. (A name that isn't valid
+    UTF-8 can't be one of the PR's files: `find_changed_sql` refuses those.)"""
+    result = run_git(workspace, ["diff", "--name-only", "-z", "--no-renames", old, new], timeout=30)
+    if result.returncode != 0:
+        raise GitError(f"Could not diff `{old[:12]}` against `{new[:12]}`: {explain_git_failure(result.stderr)}")
+    return {p for p in result.stdout.split("\0") if p}
 
 
 def head_commit_info(workspace: str) -> tuple[str, list[str]]:

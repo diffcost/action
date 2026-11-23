@@ -736,3 +736,406 @@ class TestKeptFilterMustPrune:
         )
         partition = [f for f in findings if f.description == "Partition filter removed"]
         assert len(partition) == 1 and not partition[0].partition_filter_kept
+
+
+def _blocking(findings):
+    """The findings that make a dbt Not costed model count as unknown, plus any skipped one."""
+    return [(f.description, f.risk) for f in findings if f.risk in ("high", "medium") or f.skipped]
+
+
+def _partition_removed(findings):
+    return any(f.description == "Partition filter removed" and f.risk == "high" for f in findings)
+
+
+class TestParenthesizedConditions:
+    """`(a AND b)` is two conditions, like `a AND b`."""
+
+    @pytest.mark.parametrize("metadata", [PARTITIONED, None], ids=["with metadata", "column-name guess"])
+    def test_partition_filter_dropped_from_a_parenthesized_group_is_removed(self, metadata):
+        for after in ("SELECT id FROM t WHERE status = 'paid'", "SELECT id FROM t WHERE status = 'active'"):
+            findings = analyze_structural_changes(
+                f"SELECT id FROM t WHERE ({D} AND status = 'active')", after, partition_columns=metadata,
+            )
+            assert _partition_removed(findings), after
+
+    def test_nested_parentheses_are_split_too(self):
+        findings = analyze_structural_changes(
+            f"SELECT id FROM t WHERE (({D} AND a = 1)) AND x = 1", "SELECT id FROM t WHERE a = 1 AND x = 1"
+        )
+        assert _partition_removed(findings)
+
+    def test_adding_or_removing_parentheses_is_no_change(self):
+        flat, grouped = f"SELECT id FROM t WHERE a = 1 AND {D}", f"SELECT id FROM t WHERE (a = 1 AND {D})"
+        assert analyze_structural_changes(flat, grouped) == []
+        assert analyze_structural_changes(grouped, flat) == []
+
+    def test_or_and_not_groups_stay_one_condition(self):
+        import sqlglot
+        from analysis.structural import _split_and_predicates
+
+        for where, conditions in (
+            (f"({D} OR is_late) AND a = 1", [f"({D} OR is_late)", "a = 1"]),
+            (f"NOT ({D} AND a = 1)", [f"NOT ({D} AND a = 1)"]),
+            (f"(({D} AND a = 1)) AND x = 1", [D, "a = 1", "x = 1"]),
+        ):
+            where_clause = sqlglot.parse_one(f"SELECT id FROM t WHERE {where}", dialect="bigquery").args["where"]
+            assert [c.sql(dialect="bigquery") for c in _split_and_predicates(where_clause.this)] == conditions, where
+
+
+class TestFewerConditionTexts:
+    """A query that keeps some conditions is flagged per removed condition, never by a count."""
+
+    def test_two_bounds_rewritten_as_between_is_no_finding(self):
+        for column, low, high in (("event_date", "'2024-01-01'", "'2024-01-31'"), ("amount", "1", "5")):
+            findings = analyze_structural_changes(
+                f"SELECT id FROM t WHERE {column} >= {low} AND {column} <= {high}",
+                f"SELECT id FROM t WHERE {column} BETWEEN {low} AND {high}",
+            )
+            assert not _blocking(findings), column
+
+    def test_a_removed_condition_is_flagged_once(self):
+        findings = analyze_structural_changes(
+            "SELECT id FROM t WHERE a = 1 AND b = 2", "SELECT id FROM t WHERE a = 1"
+        )
+        assert _blocking(findings) == [("WHERE clause removed", "medium")]
+
+
+class TestTablesNamedLikeACte:
+    """A CTE is referenced by its bare name: a qualified table is a table."""
+
+    def test_import_cte_repointed_to_another_dataset_is_a_new_table(self):
+        findings = analyze_structural_changes(
+            "WITH orders AS (SELECT id FROM p.stg.orders) SELECT id FROM orders",
+            "WITH orders AS (SELECT id FROM p.raw.orders) SELECT id FROM orders",
+        )
+        assert any(f.description == "New table reference" and f.subject == "p.raw.orders" for f in findings)
+
+    def test_import_cte_renamed_is_no_new_table(self):
+        findings = analyze_structural_changes(
+            "WITH orders AS (SELECT id FROM p.stg.orders) SELECT id FROM orders",
+            "WITH src_orders AS (SELECT id FROM p.stg.orders) SELECT id FROM src_orders",
+        )
+        assert not _blocking(findings)
+
+    def test_qualified_table_read_next_to_a_cte_of_the_same_name_is_a_new_table(self):
+        findings = analyze_structural_changes(
+            "WITH orders AS (SELECT 1 AS id) SELECT id FROM orders",
+            "WITH orders AS (SELECT 1 AS id) SELECT id FROM orders WHERE id IN (SELECT id FROM raw.orders)",
+        )
+        assert any(f.description == "New table reference" and f.subject == "raw.orders" for f in findings)
+
+
+class TestSeveralStatements:
+    """Every statement of a file is compared, as one query."""
+
+    def test_filter_dropped_from_a_later_statement_is_removed(self):
+        for before, after in (
+            (f"SELECT 1; SELECT id FROM raw.events WHERE {D}", "SELECT 1; SELECT id FROM raw.events"),
+            ("DECLARE d DATE DEFAULT CURRENT_DATE(); SELECT id FROM raw.events WHERE event_date >= d;",
+             "DECLARE d DATE DEFAULT CURRENT_DATE(); SELECT id FROM raw.events;"),
+        ):
+            assert _partition_removed(analyze_structural_changes(before, after)), before
+
+    def test_select_star_added_after_a_temp_function(self):
+        findings = analyze_structural_changes(
+            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT f(id) FROM raw.events",
+            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT * FROM raw.events",
+        )
+        assert any(f.description == "SELECT * added" for f in findings)
+
+    def test_a_statement_added_in_front_changes_nothing(self):
+        findings = analyze_structural_changes(
+            f"SELECT id FROM raw.events WHERE {D}",
+            f"DECLARE d DATE DEFAULT CURRENT_DATE(); SELECT id FROM raw.events WHERE {D}",
+        )
+        assert not _blocking(findings)
+
+    def test_trailing_semicolons_and_comments_change_nothing(self):
+        assert analyze_structural_changes("SELECT id FROM t WHERE x = 1;", "SELECT id FROM t WHERE x = 1") == []
+        assert analyze_structural_changes(
+            "SELECT id FROM t WHERE x = 1; -- end\n", "-- c\nSELECT id FROM t WHERE x = 1;;"
+        ) == []
+
+    def test_a_script_with_nothing_to_analyze_is_skipped(self):
+        for before, after in (
+            ("DECLARE d DATE DEFAULT CURRENT_DATE()", "DECLARE d DATE DEFAULT CURRENT_DATE(); CALL p.d.proc()"),
+            ("SELECT id FROM t", "CALL p.d.proc()"),
+        ):
+            findings = analyze_structural_changes(before, after)
+            assert findings and all(f.skipped for f in findings), after
+            assert findings[0].detail.startswith("nothing to analyze"), after
+
+    def test_unparseable_sql_says_so(self):
+        findings = analyze_structural_changes("SELECT id FROM t", "SELECT FROM WHERE (((")
+        assert findings[0].detail.startswith("sqlglot parse error")
+
+    BLOCK = ("BEGIN\n  DECLARE n INT64 DEFAULT 1;\n  SELECT id FROM p.d.events WHERE event_date >= '2024-01-01';\n"
+             "  SELECT id FROM p.d.users WHERE status = 'a';\nEND;")
+
+    def test_the_first_statement_of_a_begin_block_is_read(self):
+        """sqlglot keeps `BEGIN` with the text up to the first `;`: removing the DECLARE above
+        a query must not hide the query."""
+        assert analyze_structural_changes(self.BLOCK, self.BLOCK.replace("  DECLARE n INT64 DEFAULT 1;\n", "")) == []
+
+    def test_a_filter_dropped_inside_a_begin_block_is_removed(self):
+        before = self.BLOCK.replace("  DECLARE n INT64 DEFAULT 1;\n", "")
+        after = before.replace(" WHERE event_date >= '2024-01-01'", "")
+        assert _partition_removed(analyze_structural_changes(before, after))
+
+    def test_statements_inside_if_and_exception_blocks_are_read(self):
+        for before, after in (
+            (f"IF a THEN SELECT id FROM p.d.x WHERE {D}; END IF;", "IF a THEN SELECT id FROM p.d.x; END IF;"),
+            (f"BEGIN SELECT 1; EXCEPTION WHEN ERROR THEN SELECT id FROM p.d.x WHERE {D}; END;",
+             "BEGIN SELECT 1; EXCEPTION WHEN ERROR THEN SELECT id FROM p.d.x; END;"),
+        ):
+            assert _partition_removed(analyze_structural_changes(before, after)), before
+
+
+class TestDeepQueries:
+    """Long UNION ALL and AND chains are deep trees: no check may recurse once per branch."""
+
+    def test_a_long_union_all_is_analyzed(self):
+        import sys
+
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(1000)  # Python's default
+        try:
+            for projection in ("id", "*"):
+                sql = " UNION ALL ".join(f"SELECT {projection} FROM p.d.t{i}" for i in range(1500))
+                assert analyze_structural_changes(sql, sql) == [], projection
+        finally:
+            sys.setrecursionlimit(limit)
+
+    def test_deeply_nested_subqueries_are_skipped_not_raised(self):
+        """sqlglot's parser recurses once per nested subquery: past its depth the version is
+        "could not parse" (skipped), never an exception."""
+        n = 300
+        before = "select * from (" * n + "select id from `p`.`raw`.`o`" + ")" * n
+        after = "select * from (" * n + "select id, amount from `p`.`raw`.`o`" + ")" * n
+        findings = analyze_structural_changes(before, after)
+        assert findings and all(f.skipped for f in findings)
+
+    def test_a_long_and_chain_is_analyzed(self):
+        sql = "SELECT id FROM t WHERE " + " AND ".join(f"c{i} = {i}" for i in range(1500))
+        assert analyze_structural_changes(sql, sql) == []
+        findings = analyze_structural_changes(sql, sql.replace(" AND c7 = 7", ""))
+        assert _blocking(findings) == [("WHERE clause removed", "medium")]
+
+
+def _label(value):
+    """Test ids from a (label, before, after) row: the label, and nothing for the SQL."""
+    return value if not value.lstrip().lower().startswith(("select", "with")) else ""
+
+
+class TestStarReachingTheResult:
+    """`SELECT * added` is about the tables whose every column reaches the result through `*`."""
+
+    def _star(self, before, after):
+        findings = analyze_structural_changes(before, after)
+        assert not any(f.skipped for f in findings)
+        return any(f.description == "SELECT * added" for f in findings)
+
+    def test_star_added_in_a_cte_that_an_outer_star_reads(self):
+        assert self._star(
+            "WITH base AS (SELECT id, dt FROM big_table) SELECT * FROM base",
+            "WITH base AS (SELECT * FROM big_table) SELECT * FROM base",
+        )
+
+    def test_star_added_in_a_derived_table_that_an_outer_star_reads(self):
+        assert self._star("SELECT * FROM (SELECT id FROM big) x", "SELECT * FROM (SELECT * FROM big) x")
+
+    def test_star_over_a_cte_with_a_column_list_reads_no_more_columns(self):
+        assert not self._star("SELECT id FROM orders", "WITH s AS (SELECT id FROM orders) SELECT * FROM s")
+
+    def test_a_pass_through_cte_is_no_star_added(self):
+        assert not self._star(
+            "WITH j AS (SELECT * FROM a) SELECT * FROM j",
+            "WITH j AS (SELECT * FROM a), final AS (SELECT * FROM j) SELECT * FROM final",
+        )
+
+    def test_star_added_in_one_union_branch(self):
+        assert self._star("SELECT id FROM a UNION ALL SELECT id FROM b", "SELECT id FROM a UNION ALL SELECT * FROM b")
+
+    def test_star_added_to_a_create_table_as_select(self):
+        assert self._star("CREATE TABLE x AS SELECT id FROM t", "CREATE TABLE x AS SELECT * FROM t")
+
+    def test_unnest_sources_and_recursive_ctes_never_fail_the_analysis(self):
+        ga4 = "SELECT * FROM `p.d.events`, UNNEST(event_params) AS ep, UNNEST(items) AS it"
+        assert not self._star(ga4, f"{ga4} WHERE ep.key = 'x'")
+        recursive = "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT {} FROM r"
+        self._star(recursive.format("n"), recursive.format("*"))
+
+    def test_swapped_table_under_an_unchanged_star_is_a_new_table_not_a_star(self):
+        findings = analyze_structural_changes("SELECT * FROM p.d.a", "SELECT * FROM p.d.b")
+        assert [f.description for f in findings] == ["New table reference"]
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("the row as a function argument",
+         "WITH c AS (SELECT id, amount FROM p.d.orders) SELECT TO_JSON_STRING(c) AS j FROM c",
+         "WITH c AS (SELECT * FROM p.d.orders) SELECT TO_JSON_STRING(c) AS j FROM c"),
+        ("the row as a value", "WITH c AS (SELECT id FROM p.d.orders) SELECT c FROM c",
+         "WITH c AS (SELECT * FROM p.d.orders) SELECT c FROM c"),
+        ("the row of a table read through its name", "SELECT id FROM p.d.orders",
+         "SELECT TO_JSON_STRING(orders) AS j FROM p.d.orders"),
+        ("dbt_utils.deduplicate: the row aggregated, then the struct starred",
+         "SELECT id, amount FROM p.d.orders QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) = 1",
+         "SELECT unique.* FROM (SELECT ARRAY_AGG(original ORDER BY updated_at DESC LIMIT 1)[OFFSET(0)] unique "
+         "FROM p.d.orders original GROUP BY id)"),
+        ("a column named like the CTE is its row (BigQuery prefers the source's name)",
+         "with source as (select * from p.d.raw), renamed as (select id from source) select * from renamed",
+         "with source as (select * from p.d.raw), renamed as (select id, source from source) select * from renamed"),
+    ], ids=_label)
+    def test_a_whole_row_read_counts_like_a_star(self, label, before, after):
+        assert self._star(before, after), label
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("CTE join refactor",
+         "with orders as (select * from `p`.`d`.`orders`), customers as (select * from `p`.`d`.`customers`), "
+         "final as (select orders.*, customers.name from orders left join customers using (customer_id)) select * from final",
+         "with orders as (select * from `p`.`d`.`orders`), customers as (select customer_id, name from `p`.`d`.`customers`), "
+         "final as (select o.*, c.name, o.discount from orders o left join customers c using (customer_id)) select * from final"),
+        ("import CTE with QUALIFY", "select * from `p`.`d`.`orders`",
+         "with orders as (select * from `p`.`d`.`orders`), final as (select * except (legacy) from orders "
+         "qualify row_number() over (partition by id order by ts desc) = 1) select * from final"),
+        ("UNION through CTEs", "select * from `p`.`d`.`a` union all select * from `p`.`d`.`b`",
+         "with a as (select * from `p`.`d`.`a`), b as (select * from `p`.`d`.`b`) select * from a union all select * from b"),
+        ("import CTE read by named columns", "select o.id, o.amount from `p`.`d`.`orders` o",
+         "with orders as (select * from `p`.`d`.`orders`) select id, amount, discount from orders"),
+        ("parenthesized join", "SELECT * FROM (`p`.`d`.`a` JOIN `p`.`d`.`b` USING (id))",
+         "SELECT * FROM `p`.`d`.`a` JOIN `p`.`d`.`b` USING (id)"),
+        ("dbt_utils.deduplicate unchanged",
+         "SELECT unique.* FROM (SELECT ARRAY_AGG(original ORDER BY u DESC LIMIT 1)[OFFSET(0)] unique FROM p.d.o original GROUP BY id)",
+         "SELECT unique.* FROM (SELECT ARRAY_AGG(original ORDER BY u DESC LIMIT 1)[OFFSET(0)] unique FROM p.d.o original GROUP BY id)"),
+    ], ids=_label)
+    def test_refactors_that_read_the_same_columns_have_no_risk(self, label, before, after):
+        assert not _blocking(analyze_structural_changes(before, after)), label
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("a star over a CTE that lists more columns than the result took",
+         "WITH s AS (SELECT id, name, email, payload FROM p.d.users) SELECT id, name FROM s",
+         "WITH s AS (SELECT id, name, email, payload FROM p.d.users) SELECT * FROM s"),
+        ("a star over a derived table that lists more columns than the result took",
+         "SELECT id FROM (SELECT id, name, payload FROM p.d.users)",
+         "SELECT * FROM (SELECT id, name, payload FROM p.d.users)"),
+        ("a star next to a named column over a wider CTE",
+         "WITH s AS (SELECT id, name, email FROM p.d.users) SELECT id FROM s",
+         "WITH s AS (SELECT id, name, email FROM p.d.users) SELECT *, 1 AS x FROM s"),
+        ("named columns of a join become a star over a wider CTE",
+         "SELECT a.id, b.x FROM p.d.a a JOIN p.d.b b USING (id)",
+         "WITH j AS (SELECT a.id, b.x, b.y FROM p.d.a a JOIN p.d.b b USING (id)) SELECT * FROM j"),
+        ("a star inside an ARRAY subquery of the SELECT list",
+         "SELECT o.id, ARRAY(SELECT AS STRUCT i.sku FROM p.d.items i WHERE i.order_id = o.id) AS items FROM p.d.orders o",
+         "SELECT o.id, ARRAY(SELECT AS STRUCT * FROM p.d.items i WHERE i.order_id = o.id) AS items FROM p.d.orders o"),
+        ("a star over a table function", "SELECT id FROM p.d.tvf(1)", "SELECT * FROM p.d.tvf(1)"),
+        ("a star over an unqualified table function", "SELECT id FROM tvf(1)", "SELECT * FROM tvf(1)"),
+        ("a second table function of the same dataset starred",
+         "SELECT a.* FROM p.d.tvf_a(1) a JOIN p.d.tvf_b(1) b USING (id)",
+         "SELECT a.*, b.* FROM p.d.tvf_a(1) a JOIN p.d.tvf_b(1) b USING (id)"),
+        ("a list with a struct's fields, read through a star", "SELECT event_date FROM p.ga4.events",
+         "WITH x AS (SELECT event_date, user_id, device.* FROM p.ga4.events) SELECT * FROM x"),
+        ("a list with an UNNEST alias's fields, read through a star", "SELECT t.id FROM p.d.t t",
+         "WITH x AS (SELECT t.id, t.name, t.payload, e.* FROM p.d.t t, UNNEST(t.items) e) SELECT * FROM x"),
+        ("a list of two tables' columns of the same names",
+         "SELECT a.id, a.name FROM p.d.a a JOIN p.d.b b ON a.k = b.k",
+         "WITH s AS (SELECT a.id, a.name, b.id AS b_id, b.name AS b_name FROM p.d.a a JOIN p.d.b b ON a.k = b.k) "
+         "SELECT * FROM s"),
+        ("one CTE read by two stars whose EXCEPTs leave out different columns",
+         "WITH s AS (SELECT id, name, notes FROM p.d.u) SELECT id, name FROM s",
+         "WITH s AS (SELECT id, name, notes FROM p.d.u) SELECT a.* EXCEPT (notes), b.* EXCEPT (id, name) "
+         "FROM s a JOIN s b ON a.id = b.id"),
+    ], ids=_label)
+    def test_a_star_that_reads_more_columns_than_before(self, label, before, after):
+        assert self._star(before, after), label
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("named columns become a staging model with the same list", "select id, name from p.d.raw",
+         "with source as (select * from p.d.raw), renamed as (select id, name from source) select * from renamed"),
+        ("a CTE of constants", "SELECT 1 AS a", "WITH s AS (SELECT 1 AS a, 2 AS b, 3 AS c) SELECT * FROM s"),
+        ("a star whose EXCEPT leaves out what the result didn't take",
+         "WITH s AS (SELECT id, name, _loaded_at FROM p.d.users) SELECT id, name FROM s",
+         "WITH s AS (SELECT id, name, _loaded_at FROM p.d.users) SELECT * EXCEPT (_loaded_at) FROM s"),
+        ("the same through an import CTE",
+         "with source as (select * from p.d.raw), renamed as (select id, name, _synced from source) select id, name from renamed",
+         "with source as (select * from p.d.raw), renamed as (select id, name, _synced from source) "
+         "select * except (_synced) from renamed"),
+        ("derived entries and constants read no more columns", "SELECT id, amount FROM p.d.orders",
+         "WITH final AS (SELECT id, amount, amount * 100 AS amount_cents, CURRENT_TIMESTAMP() AS loaded_at "
+         "FROM p.d.orders) SELECT * FROM final"),
+        ("a MERGE's USING moved into a CTE",
+         "MERGE p.d.x T USING (SELECT id, v FROM p.d.s) S ON T.id = S.id WHEN MATCHED THEN UPDATE SET v = S.v",
+         "MERGE p.d.x T USING (WITH c AS (SELECT id, v FROM p.d.s) SELECT * FROM c) S ON T.id = S.id "
+         "WHEN MATCHED THEN UPDATE SET v = S.v"),
+        ("the join key the result already read",
+         "WITH o AS (SELECT * FROM p.d.orders), c AS (SELECT * FROM p.d.customers) "
+         "SELECT o.*, c.name FROM o JOIN c USING (customer_id)",
+         "WITH o AS (SELECT * FROM p.d.orders), c AS (SELECT customer_id, name FROM p.d.customers) "
+         "SELECT o.* EXCEPT (customer_id), c.* FROM o JOIN c USING (customer_id)"),
+    ], ids=_label)
+    def test_a_star_over_a_list_no_wider_than_the_result_is_no_star_added(self, label, before, after):
+        assert not self._star(before, after), label
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("a staging model's column list grows",
+         "with source as (select * from p.d.raw), renamed as (select id, name from source) select * from renamed",
+         "with source as (select * from p.d.raw), renamed as (select id, name, email from source) select * from renamed"),
+        ("a derived table's list grows", "SELECT * FROM (SELECT id, name FROM p.d.t)",
+         "SELECT * FROM (SELECT id, name, email FROM p.d.t)"),
+        ("a CTE renamed", "WITH a AS (SELECT id, x, y FROM p.d.t) SELECT * FROM a",
+         "WITH b AS (SELECT id, x, y FROM p.d.t) SELECT * FROM b"),
+        ("a table's star narrowed to a CTE's list", "SELECT * FROM p.d.users",
+         "WITH s AS (SELECT id, name, email FROM p.d.users) SELECT * FROM s"),
+    ], ids=_label)
+    def test_a_column_list_changed_under_a_star_the_base_had_is_no_star_added(self, label, before, after):
+        """A star the base version already had reaches the same tables: a list that grows under
+        it is a wider SELECT (priced by the dry run), not a new star."""
+        assert not self._star(before, after), label
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("under an import CTE",
+         "WITH source AS (SELECT * FROM `p`.`ga4`.`events`) SELECT event_date, device.category FROM source",
+         "WITH source AS (SELECT * FROM `p`.`ga4`.`events`) SELECT event_date, device.* FROM source"),
+        ("from the table", "SELECT event_date, device.category FROM `p`.`ga4`.`events`",
+         "SELECT event_date, device.* FROM `p`.`ga4`.`events`"),
+    ], ids=_label)
+    def test_a_struct_columns_fields_read_only_that_column(self, label, before, after):
+        assert not self._star(before, after), label
+
+    @pytest.mark.parametrize("label,before,after", [
+        ("through its alias",
+         "SELECT product, Q1 FROM p.d.sales PIVOT(SUM(amount) FOR quarter IN ('Q1', 'Q2')) AS pv",
+         "SELECT pv.* FROM p.d.sales PIVOT(SUM(amount) FOR quarter IN ('Q1', 'Q2')) AS pv"),
+        ("through a bare star", "SELECT product, Q1 FROM p.d.sales PIVOT(SUM(amount) FOR quarter IN ('Q1', 'Q2'))",
+         "SELECT * FROM p.d.sales PIVOT(SUM(amount) FOR quarter IN ('Q1', 'Q2'))"),
+    ], ids=_label)
+    def test_a_pivoted_table_is_read_in_full_in_both_versions(self, label, before, after):
+        """PIVOT groups by every input column it doesn't aggregate or pivot: the table is read in
+        full whatever the result takes, so a star over the pivot reads nothing more."""
+        assert not self._star(before, after), label
+
+    def test_a_star_inside_exists_only_tests_rows(self):
+        assert not self._star("SELECT id FROM p.d.t", "SELECT id, EXISTS(SELECT * FROM p.d.t WHERE id > 0) AS e FROM p.d.t")
+
+
+class TestOutermostColumnCount:
+    def test_union_counts_its_first_select(self):
+        findings = analyze_structural_changes(
+            "SELECT a FROM t1 UNION ALL SELECT x FROM (SELECT x FROM t2)",
+            "SELECT a, b, c, d, e, f FROM t1 UNION ALL SELECT x, x, x, x, x, x FROM (SELECT x FROM t2)",
+        )
+        assert any(f.description.startswith("SELECT expanded by 5 columns") for f in findings)
+
+    def test_create_table_as_counts_the_query_it_stores_not_a_subquery(self):
+        findings = analyze_structural_changes(
+            "CREATE TABLE x AS SELECT a FROM (SELECT a FROM t)",
+            "CREATE TABLE x AS SELECT a FROM (SELECT a, b, c, d FROM t)",
+        )
+        assert not any(f.description.startswith("SELECT expanded") for f in findings)
+
+
+class TestUnnestStarInsideAParenthesizedJoin:
+    def test_star_of_an_unnest_alias_in_a_parenthesized_join_reads_no_table(self):
+        findings = analyze_structural_changes(
+            "SELECT t.id FROM (p.d.t t JOIN UNNEST(t.items) i ON TRUE)",
+            "SELECT t.id, i.* FROM (p.d.t t JOIN UNNEST(t.items) i ON TRUE)",
+        )
+        assert not any(f.description == "SELECT * added" for f in findings)

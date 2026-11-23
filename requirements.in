@@ -2,7 +2,7 @@
 # these and every transitive dependency pinned with hashes (pip --require-hashes), so a
 # new upstream release never reaches customers' runs until it is locked here.
 # After editing this file, regenerate the lock with versions at least two weeks old:
-#   uv pip compile requirements.in --universal --python-version 3.11 --generate-hashes \
+#   uv pip compile requirements.in --universal --python-version 3.14 --generate-hashes \
 #     --exclude-newer "$(date -u -v-14d +%Y-%m-%d)" -o requirements.txt
 # (GNU date: `date -u -d '14 days ago' +%Y-%m-%d`)
 # When pip-audit (CI) flags a locked version whose fix is newer than that cutoff, add a

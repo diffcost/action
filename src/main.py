@@ -43,8 +43,8 @@ from comment import (
 )
 from config import DEFAULT_RUNS_PER_MONTH, ActionConfig, ThresholdConfig, load_config, settable_parameter
 
-# google-api-core warns at import that Google will stop supporting the image's Python
-# version in its future releases. Customers can't act on it, and the lock pins the version.
+# google-api-core warns at import once the image's Python version nears the end of Google's
+# support for it. Customers can't act on it, and the lock pins the version.
 warnings.filterwarnings("ignore", category=FutureWarning, module=r"google\.api_core\._python_version_support")
 
 _DEFAULT_API_URL = "https://diffcost.dev"
@@ -65,7 +65,8 @@ _STRUCTURAL_RISKS = ("high", "medium")
 
 def _get_api_url() -> str:
     """Get and validate the DiffCost API URL. Enforces HTTPS and strict domain allowlist."""
-    url = os.environ.get("DIFFCOST_API_URL", _DEFAULT_API_URL)
+    # A trailing slash would make every request path start with "//"
+    url = os.environ.get("DIFFCOST_API_URL", _DEFAULT_API_URL).rstrip("/")
     parsed = urlparse(url)
     # Allow plain HTTP for local development only
     if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
@@ -677,6 +678,23 @@ def _table_info(dr: dict | None, table_meta: dict) -> dict:
     return {"partition_columns": partition, "cluster_columns": cluster}
 
 
+def _priced_against_existing_tables(dr: dict, item, meta: dict, bq_client, config: ActionConfig, options: dict) -> dict:
+    """A dbt model that reads a renamed or moved model (or a renamed seed) under its new name:
+    that table isn't built until the merge, so the PR's dry run finds it missing ("Not
+    found"). The PR version is priced against the existing table instead (its data before
+    this PR), with relation names mapped back to the baseline's (`structural_pr_sql`). If that dry run fails too, the
+    first result stands. The mapped SQL stays in memory: only the dry run's numbers are kept."""
+    from analysis.bq_dryrun import dry_run_pair
+
+    mapped = meta.get("structural_pr_sql")
+    if not mapped or item.adapter != "dbt" or not dr.get("pr_depends_on_new_objects") or dr.get("pr_error"):
+        return dr  # only a "Not found" (an "Unrecognized name" has a `pr_error`)
+    retry = dry_run_pair(bq_client, item.production_sql, mapped, config.cost_per_tb, **options)
+    if retry.get("error") or retry.get("pr_depends_on_new_objects") or retry.get("unmaterialized_upstream"):
+        return dr
+    return retry
+
+
 def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta_cache=None) -> dict:
     """`meta_cache` (TableMetaCache): reads the metadata of the tables the dry runs reference."""
     from analysis.accuracy import assess, unbound_parameters
@@ -713,6 +731,7 @@ def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta
             result["priced_with_parameters"] = bool(plain_sql and config.query_parameters)
             try:
                 dr = dry_run_pair(bq_client, item.production_sql, item.pr_sql, config.cost_per_tb, **options)
+                dr = _priced_against_existing_tables(dr, item, meta, bq_client, config, options)
             except Exception as e:
                 dr = {"error": f"dry run failed ({type(e).__name__})", "cost_before": None, "cost_after": None}
         if not dr.get("error"):
@@ -727,8 +746,11 @@ def _analyze_item(item, bq_client, config: ActionConfig, started_at: float, meta
     structural_ran = False  # both versions were parsed and every check ran
     try:
         if item.production_sql and item.pr_sql:
+            # dbt: the PR's SQL with relation names mapped to the baseline's, when they differ
+            # (a renamed or moved upstream model is the same table under another name)
+            structural_pr_sql = str(meta.get("structural_pr_sql") or item.pr_sql)
             findings = analyze_structural_changes(
-                item.production_sql, item.pr_sql, **_table_info(result["dry_run"], table_meta)
+                item.production_sql, structural_pr_sql, **_table_info(result["dry_run"], table_meta)
             )
             result["structural_findings"] = findings
             structural_ran = not any(f.skipped for f in findings)

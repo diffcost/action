@@ -137,7 +137,7 @@ Every input is optional. The [configuration reference](https://diffcost.dev/docs
 | `api_key` | — | DiffCost API key: dashboard history on every plan; merge blocking, Slack alerts and trends on paid plans and the trial. |
 | `github_token` | `${{ github.token }}` | Token that posts the PR comment. The job needs `pull-requests: write`. |
 | `config_path` | `.diffcost.yml` | Path of the config file. DiffCost always reads it from the base branch. |
-| `base_ref` | The PR's base | Compare against this instead: a branch name, a `refs/heads/` or `refs/remotes/` ref, or a full commit SHA. Never a tag. |
+| `base_ref` | The PR's base | Use this base instead (the PR is compared where its branch meets it): a branch name, a `refs/heads/` or `refs/remotes/` ref, or a full commit SHA. Never a tag. |
 | `cost_per_tb` | `6.25` | USD per TiB for on-demand pricing. With an API key, the dashboard's value is used. |
 | `bq_pricing_model` | `on_demand` | `on_demand` shows dollars; `editions` shows bytes scanned. With an API key, the dashboard's value is used. |
 | `comment_on_clean` | `false` | Post a comment even when the PR changes no SQL. |
@@ -157,7 +157,7 @@ Every input is optional. The [configuration reference](https://diffcost.dev/docs
 | `items_unknown` | Number of queries whose cost could not be determined (excluded from totals). |
 | `total_bytes_before` | Bytes scanned per run by the base versions. |
 | `total_bytes_after` | Bytes scanned per run by the PR versions. |
-| `scan_multiplier` | PR scan volume divided by base scan volume, such as `4.20`. |
+| `scan_multiplier` | PR scan volume divided by base scan volume, such as `4.20`; `1.00` when the base versions scan 0 B in total. |
 | `policy_exceeded` | `true` when the cost policy was exceeded, enforced or not. |
 | `blocked` | `true` when the policy was exceeded and the failing `diffcost/cost-check` status was posted. |
 
@@ -211,7 +211,7 @@ GitHub builds the Action on the runner from its `Dockerfile`: the base image is 
 
 This repository is published from DiffCost's source repository at each release, so a commit made here is overwritten by the next one. Bug reports and suggestions are welcome as issues. If you open a pull request, we apply an accepted change to the source and it ships in the next release.
 
-To run the tests (Python 3.11 or later):
+To run the tests (Python 3.14 or later):
 
 ```bash
 pip install -r requirements.txt   # the hash-pinned lock the Docker image installs

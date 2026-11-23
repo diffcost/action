@@ -6,6 +6,7 @@ import shutil
 import pytest
 
 from adapters.dbt import ManifestError, dbt_project_dir, find_changed_dbt_models
+from adapters.sql_files import BASE_MOVED_REASON
 from gitutil import GitError
 from config import ActionConfig
 
@@ -273,6 +274,18 @@ class TestWithoutBaseline:
         assert [c.name for c in changed] == ["non-model dbt files"]
         reason = changed[0].metadata["unknown_reason"]
         assert "2 changed file(s)" in reason and "macros/m.sql" in reason and "README" not in reason
+
+    @pytest.mark.parametrize("path", [
+        "tests/props.yml",  # dbt reads YAML under test-paths as properties (model config too)
+        "package-lock.yml",  # pins the package versions
+    ])
+    def test_test_path_yaml_and_the_package_lock_are_non_model_files(self, checkout_repo, path):
+        repo = checkout_repo({"dbt_project.yml": "name: p", "models/a.sql": "select 1", path: "v1"})
+        repo.write(path, "v2")
+        repo.commit()
+        repo.write("target/manifest.json", _manifest(_node("a", "select 1")))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "non-model dbt files" and path in item.metadata["unknown_reason"]
 
     def test_changed_uncompiled_model_without_baseline_is_unknown(self, checkout_repo):
         repo = checkout_repo({"models/a.sql": "select 1", "models/b.sql": "select 2"})
@@ -933,3 +946,743 @@ class TestRelationCreated:
         assert not relation_created({"kind": "dataset", "name": "my-project:ci_pr_12"}, rels)
         assert not relation_created({"kind": "table", "name": ""}, rels)
         assert not relation_created({"kind": "table", "name": "my-project:marts.fct_new"}, [])
+
+    def test_domain_scoped_projects(self):
+        """A project id such as `example.com:my-proj` holds a dot and a colon; BigQuery's error
+        writes the table as `example.com:my-proj:marts.fct_new`."""
+        from adapters.dbt import relation_created
+
+        rels = ["`example.com:my-proj`.`marts`.`fct_new`"]
+        assert relation_created({"kind": "table", "name": "example.com:my-proj:marts.fct_new"}, rels)
+        assert relation_created({"kind": "view", "name": "example.com:my-proj.marts.fct_new"}, rels)
+        assert relation_created({"kind": "dataset", "name": "example.com:my-proj:marts"}, rels)
+        assert not relation_created({"kind": "table", "name": "other-proj:marts.fct_new"}, rels)
+        assert not relation_created({"kind": "table", "name": "example.com:my-proj:ci.fct_new"}, rels)
+        assert not relation_created({"kind": "dataset", "name": "example.com:other:marts"}, rels)
+
+
+def _with_sources(nodes, sources):
+    """A manifest from (unique_id, node, parents) tuples plus {source id: relation_name}."""
+    manifest = json.loads(_graph(*nodes))
+    manifest["sources"] = {sid: {"relation_name": rel, "resource_type": "source"} for sid, rel in sources.items()}
+    return json.dumps(manifest)
+
+
+class TestSourcesAndRelationNames:
+    """Relation names are mapped only for nodes dbt builds: a source that names another table
+    changes what its readers scan."""
+
+    def test_a_source_pointed_at_another_table_changes_its_readers(self, checkout_repo):
+        repo = checkout_repo({"models/stg.sql": "select id from {{ source('raw', 'events') }}",
+                              "models/sources.yml": "identifier: events_sample"})
+        repo.write("models/sources.yml", "identifier: events_full_history")
+        repo.commit()
+        src = "source.proj.raw.events"
+        def stg(table):
+            sql = f"select id from `p`.`raw`.`{table}`"
+            return ("model.proj.stg", _node("stg", sql, checksum="same", relation="`p`.`prod`.`stg`"), [src])
+
+        repo.write("target/manifest.json", _with_sources([stg("events_full_history")],
+                                                         {src: "`p`.`raw`.`events_full_history`"}))
+        repo.write(".diffcost-baseline/manifest.json", _with_sources([stg("events_sample")],
+                                                                     {src: "`p`.`raw`.`events_sample`"}))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "stg"
+        assert item.production_sql == "select id from `p`.`raw`.`events_sample`"
+        assert item.pr_sql == "select id from `p`.`raw`.`events_full_history`"
+        # A source isn't built by this PR: neither "Unrecognized name" nor "Not found" on it is
+        # explained by it
+        assert item.metadata["new_upstream_relations"] == []
+        assert item.metadata["changed_upstream"] is False
+
+    def test_a_model_moved_by_its_own_config_keeps_its_readers_unchanged(self, checkout_repo):
+        """dbt builds the moved model from the same SQL, so its readers read the same data."""
+        repo = checkout_repo({"models/up.sql": "select 1", "models/fct.sql": "select * from {{ ref('up') }}",
+                              "models/schema.yml": "v1"})
+        repo.write("models/schema.yml", "v2")
+        repo.commit()
+        up_base = ("model.proj.up", _with(_node("up", "select 1", checksum="u", relation="`p`.`prod`.`up`"),
+                                          materialized="table"), [])
+        up_pr = ("model.proj.up", _with(_node("up", "select 1", checksum="u", relation="`p`.`prod`.`orders_v2`"),
+                                        materialized="table", alias="orders_v2"), [])
+        def fct(rel):
+            return ("model.proj.fct", _node("fct", f"select * from {rel}", checksum="f"), ["model.proj.up"])
+
+        repo.write("target/manifest.json", _graph(up_pr, fct("`p`.`prod`.`orders_v2`")))
+        repo.write(".diffcost-baseline/manifest.json", _graph(up_base, fct("`p`.`prod`.`up`")))
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_relation_names_that_swap_map_in_one_pass(self, checkout_repo):
+        """Two models that exchanged names: each reader still compares equal to production."""
+        repo = checkout_repo({"models/a.sql": "select 1", "models/b.sql": "select 2", "models/r.sql": "select 3"})
+        def a(rel):
+            return ("model.proj.a", _node("a", "select 1", checksum="a", relation=rel), [])
+
+        def b(rel):
+            return ("model.proj.b", _node("b", "select 2", checksum="b", relation=rel), [])
+
+        def r(sql):
+            return ("model.proj.r", _node("r", sql, checksum="r"), ["model.proj.a", "model.proj.b"])
+
+        repo.write(".diffcost-baseline/manifest.json", _graph(
+            a("`p`.`d`.`a`"), b("`p`.`d`.`b`"), r("select * from `p`.`d`.`a` join `p`.`d`.`b` using (id)"),
+        ))
+        repo.write("target/manifest.json", _graph(
+            a("`p`.`d`.`b`"), b("`p`.`d`.`a`"), r("select * from `p`.`d`.`b` join `p`.`d`.`a` using (id)"),
+        ))
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_one_pass_mapping(self):
+        from adapters.dbt import _RelationMap
+
+        swap = _RelationMap({"`p`.`d`.`a`": "`p`.`d`.`b`", "`p`.`d`.`b`": "`p`.`d`.`a`"})
+        assert swap.apply("SELECT * FROM `p`.`d`.`a` JOIN `p`.`d`.`b`") == "SELECT * FROM `p`.`d`.`b` JOIN `p`.`d`.`a`"
+        # A replacement is never replaced again, even when it is another key
+        chain = _RelationMap({"`p`.`prod`.`aa`": "`p`.`d`.`b`", "`p`.`d`.`b`": "`p`.`d`.`c`"})
+        assert chain.apply("SELECT * FROM `p`.`prod`.`aa`") == "SELECT * FROM `p`.`d`.`b`"
+        # The longest key wins where one name starts another (unquoted names)
+        longest = _RelationMap({"p.d.ab": "p.d.x", "p.d.a": "p.d.y"})
+        assert longest.apply("p.d.ab p.d.a") == "p.d.x p.d.y"
+
+
+def _snapshot(name, compiled, checksum, path=None, relation=None):
+    return _node(name, compiled, checksum=checksum, path=path or f"snapshots/{name}.sql", relation=relation,
+                 resource_type="snapshot")
+
+
+class TestSnapshotsWithABaseline:
+    """With a baseline, a snapshot is compared like a model and priced as its SELECT."""
+
+    def _repo(self, checkout_repo, edit=True):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/m.sql": "select 1",
+                              "snapshots/s.sql": "{% snapshot s %}select 1{% endsnapshot %}"})
+        if edit:
+            repo.write("snapshots/s.sql", "{% snapshot s %}select * from big{% endsnapshot %}")
+            repo.commit()
+        return repo
+
+    def _write(self, repo, base_nodes, pr_nodes):
+        m = ("model.proj.m", _node("m", "select 1", checksum="m"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(m, *base_nodes))
+        repo.write("target/manifest.json", _graph(m, *pr_nodes))
+
+    def test_a_changed_snapshot_is_a_row(self, checkout_repo):
+        repo = self._repo(checkout_repo)
+        self._write(repo, [("snapshot.proj.s", _snapshot("s", "select 1", "s1"), [])],
+                    [("snapshot.proj.s", _snapshot("s", "select * from big", "s2"), [])])
+        [item] = find_changed_dbt_models(_config(repo))
+        assert (item.name, item.path) == ("s", "snapshots/s.sql")
+        assert (item.production_sql, item.pr_sql) == ("select 1", "select * from big")
+        assert item.metadata["unique_id"] == "snapshot.proj.s"
+        assert item.metadata["changed_upstream"] is False
+
+    def test_a_macro_change_to_a_snapshot_is_a_row(self, checkout_repo):
+        repo = self._repo(checkout_repo, edit=False)
+        self._write(repo, [("snapshot.proj.s", _snapshot("s", "select 1", "same"), [])],
+                    [("snapshot.proj.s", _snapshot("s", "select 1, 2 as x", "same"), [])])
+        assert [c.name for c in find_changed_dbt_models(_config(repo))] == ["s"]
+
+    def test_an_unchanged_snapshot_is_not_listed(self, checkout_repo):
+        repo = self._repo(checkout_repo, edit=False)
+        node = ("snapshot.proj.s", _snapshot("s", "select 1", "same"), [])
+        self._write(repo, [node], [node])
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_a_snapshot_whose_config_changed_but_not_its_select(self, checkout_repo):
+        """Its checksum covers the whole file (for one defined in YAML, every edit to that file):
+        a snapshot is priced as its SELECT, so only that decides."""
+        repo = self._repo(checkout_repo)
+        self._write(repo, [("snapshot.proj.s", _snapshot("s", "select 1", "s1"), [])],
+                    [("snapshot.proj.s", _snapshot("s", "select 1", "s2"), [])])
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_a_compared_snapshot_file_is_not_a_non_model_change(self, checkout_repo):
+        """An uncompiled model makes changed non-model files one unknown item; a snapshot's own
+        `.sql` file is compared through its node, so it isn't one of them."""
+        repo = self._repo(checkout_repo)
+        u = ("model.proj.u", _node("u", None, checksum="u", path="models/u.sql"), [])  # its file is unchanged
+        self._write(repo, [u, ("snapshot.proj.s", _snapshot("s", "select 1", "s1"), [])],
+                    [u, ("snapshot.proj.s", _snapshot("s", "select * from big", "s2"), [])])
+        assert [c.name for c in find_changed_dbt_models(_config(repo))] == ["s"]
+
+    def test_a_macro_change_still_counts_next_to_an_uncompiled_model(self, checkout_repo):
+        repo = self._repo(checkout_repo)
+        repo.write("macros/m.sql", "{% macro m() %}{% endmacro %}")
+        repo.commit()
+        u = ("model.proj.u", _node("u", None, checksum="u", path="models/u.sql"), [])
+        self._write(repo, [u, ("snapshot.proj.s", _snapshot("s", "select 1", "s1"), [])],
+                    [u, ("snapshot.proj.s", _snapshot("s", "select * from big", "s2"), [])])
+        items = {c.name: c for c in find_changed_dbt_models(_config(repo))}
+        assert set(items) == {"s", "non-model dbt files"}
+        assert "macros/m.sql" in items["non-model dbt files"].metadata["unknown_reason"]
+        assert "snapshots/s.sql" not in items["non-model dbt files"].metadata["unknown_reason"]
+
+    def test_new_and_removed_snapshots(self, checkout_repo):
+        repo = self._repo(checkout_repo, edit=False)
+        self._write(repo, [("snapshot.proj.old", _snapshot("old", "select 2", "o"), [])],
+                    [("snapshot.proj.new", _snapshot("new", "select 3", "n"), [])])
+        items = {c.name: c for c in find_changed_dbt_models(_config(repo))}
+        assert (items["new"].production_sql, items["new"].pr_sql) == (None, "select 3")
+        assert (items["old"].production_sql, items["old"].pr_sql) == ("select 2", None)
+
+    def test_a_snapshot_compiled_in_one_manifest_only_is_unknown(self, checkout_repo):
+        repo = self._repo(checkout_repo)
+        self._write(repo, [("snapshot.proj.s", _snapshot("s", None, "s1"), [])],
+                    [("snapshot.proj.s", _snapshot("s", "select * from big", "s2"), [])])
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "s"
+        assert item.metadata["unknown_reason"] == (
+            "the snapshot is not compiled in the baseline manifest (selective compile?), so its cost can't be compared"
+        )
+
+    def test_a_snapshot_reading_a_column_an_upstream_model_adds(self, checkout_repo):
+        """The Not costed path works for snapshots: their upstream is tracked like a model's."""
+        repo = self._repo(checkout_repo)
+        repo.write("models/m.sql", "select 1, 2 as discount")
+        repo.commit()
+        m_base = ("model.proj.m", _node("m", "select 1", checksum="m1"), [])
+        m_pr = ("model.proj.m", _node("m", "select 1, 2 as discount", checksum="m2"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(m_base, ("snapshot.proj.s", _snapshot("s", "select 1", "s1"), [])))
+        repo.write("target/manifest.json", _graph(
+            m_pr, ("snapshot.proj.s", _snapshot("s", "select discount from m", "s2"), ["model.proj.m"]),
+        ))
+        items = {c.name: c for c in find_changed_dbt_models(_config(repo))}
+        assert items["s"].metadata["changed_upstream"] is True
+
+    def test_without_a_baseline_snapshots_stay_in_the_non_model_row(self, checkout_repo):
+        repo = self._repo(checkout_repo)
+        repo.write("target/manifest.json", _graph(
+            ("model.proj.m", _node("m", "select 1", checksum="m"), []),
+            ("snapshot.proj.s", _snapshot("s", "select * from big", "s2"), []),
+        ))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "non-model dbt files"
+        assert "snapshots/s.sql" in item.metadata["unknown_reason"]
+
+    def test_tests_and_analyses_are_not_costed(self, checkout_repo):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/m.sql": "select 1",
+                              "tests/assert_x.sql": "select 1", "analyses/a.sql": "select 1"})
+        repo.write("tests/assert_x.sql", "select * from big")
+        repo.write("analyses/a.sql", "select * from big")
+        repo.commit()
+        m = ("model.proj.m", _node("m", "select 1", checksum="m"), [])
+        def t(sql):
+            node = _node("assert_x", sql, checksum=sql, path="tests/assert_x.sql", resource_type="test")
+            return ("test.proj.assert_x", node, ["model.proj.m"])
+
+        repo.write(".diffcost-baseline/manifest.json", _graph(m, t("select 1")))
+        repo.write("target/manifest.json", _graph(m, t("select * from big")))
+        assert find_changed_dbt_models(_config(repo)) == []
+
+
+class TestComparedWhereTheBranchStarted:
+    def test_a_committed_baseline_manifest_is_read_where_the_branch_starts(self, checkout_repo):
+        """The committed copy that describes the branch's starting point, not the base's tip."""
+        from tests.conftest import _git
+
+        start = _manifest(_node("a", "select 1", checksum="a1"))
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/a.sql": "select 1",
+                              "target/manifest.json": start})
+        repo.write("models/a.sql", "select 2")
+        repo.git("rm", "-q", "target/manifest.json")  # the PR stops committing it
+        repo.commit("pr")
+        (repo.upstream / "models/a.sql").write_text("select 3")
+        (repo.upstream / "target/manifest.json").write_text(_manifest(_node("a", "select 3", checksum="a3")))
+        _git(repo.upstream, "add", "-A")
+        _git(repo.upstream, "commit", "-q", "-m", "base moves on")
+        repo.git("fetch", "-q", "origin")
+        repo.write("target/manifest.json", _manifest(_node("a", "select 2", checksum="a2")))  # compiled in the run
+        tip = repo.git("rev-parse", "origin/main").strip()
+        [item] = find_changed_dbt_models(_config(repo, resolved_base_ref=tip))
+        assert (item.production_sql, item.pr_sql) == ("select 1", "select 2")
+        # The base changed models/a.sql too since the branch started
+        assert item.metadata["unknown_reason"] == BASE_MOVED_REASON
+
+    def _base_moves_on(self, checkout_repo, base_change):
+        """The PR changes models/a.sql; then the base commits `base_change` (a path -> content)."""
+        from tests.conftest import _git
+
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/a.sql": "select 1", "models/b.sql": "select 5"})
+        repo.write("models/a.sql", "select 2")
+        repo.commit("pr")
+        path, content = base_change
+        (repo.upstream / path).write_text(content)
+        _git(repo.upstream, "add", "-A")
+        _git(repo.upstream, "commit", "-q", "-m", "base moves on")
+        repo.git("fetch", "-q", "origin")
+        b = _node("b", "select 5", checksum="b")
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("a", "select 1", checksum="a1"), b))
+        repo.write("target/manifest.json", _manifest(_node("a", "select 2", checksum="a2"), b))
+        return repo, repo.git("rev-parse", "origin/main").strip()
+
+    def test_a_model_the_base_also_changed_later_is_unknown(self, checkout_repo):
+        repo, tip = self._base_moves_on(checkout_repo, ("models/a.sql", "select 3"))
+        [item] = find_changed_dbt_models(_config(repo, resolved_base_ref=tip))
+        assert item.metadata["unknown_reason"] == BASE_MOVED_REASON
+
+    def test_a_model_only_the_pr_changed_is_priced(self, checkout_repo):
+        repo, tip = self._base_moves_on(checkout_repo, ("models/b.sql", "select 6"))
+        [item] = find_changed_dbt_models(_config(repo, resolved_base_ref=tip))
+        assert (item.name, item.production_sql, item.pr_sql) == ("a", "select 1", "select 2")
+        assert "unknown_reason" not in item.metadata
+
+    def _macro_on_both_sides(self, checkout_repo, macro_path="macros/m.sql", files=None):
+        """The base put a saving into a macro after the branch started; the PR has that saving
+        too (cherry-picked) plus an increase of its own in the same file."""
+        from tests.conftest import _git
+
+        before = "{% macro f() %}\nwhere true\n-- joins\n\n\n\n\n{% endmacro %}\n"
+        saving = before.replace("where true", "where dt = current_date()")
+        both = saving.replace("-- joins", "cross join huge")
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/r.sql": "select * from t {{ f() }}",
+                              macro_path: before, **(files or {})})
+        repo.write(macro_path, both)
+        repo.commit("pr")
+        (repo.upstream / macro_path).write_text(saving)
+        _git(repo.upstream, "commit", "-q", "-am", "base moves on")
+        repo.git("fetch", "-q", "origin")
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("r", "select * from t where true", checksum="r")))
+        repo.write("target/manifest.json", _manifest(
+            _node("r", "select * from t where dt = current_date() cross join huge", checksum="r")))
+        return repo, repo.git("rev-parse", "origin/main").strip()
+
+    def test_a_macro_the_base_also_changed_later_is_unknown(self, checkout_repo):
+        """Priced from the branch point, the base's saving would offset the PR's increase."""
+        repo, tip = self._macro_on_both_sides(checkout_repo)
+        items = {c.name: c.metadata for c in find_changed_dbt_models(_config(repo, resolved_base_ref=tip))}
+        assert set(items) == {"r", "non-model dbt files"}
+        assert items["non-model dbt files"]["unknown_reason"] == (
+            "1 changed file(s) outside model files were also changed by the base branch since this PR's branch "
+            "started: update the branch (merge or rebase the base branch into it) (macros/m.sql)"
+        )
+
+    def test_the_comment_keeps_what_to_do_with_long_paths(self, checkout_repo):
+        from adapters.dbt import _base_moved_non_model_reason
+        from comment import REASON_LIMIT, shorten
+
+        paths = [f"dbt/very/deeply/nested/directory/number_{i}/with_a_long_file_name_{i}.yml" for i in range(5)]
+        assert "update the branch" in shorten(_base_moved_non_model_reason(paths), REASON_LIMIT)
+        assert "update the branch" in shorten(
+            f"{BASE_MOVED_REASON}; no production baseline (no baseline manifest in this run)", REASON_LIMIT)
+
+    def test_a_renamed_macro_the_base_also_changed_later_is_unknown(self, checkout_repo):
+        """The PR moved the file (still a rename) and edited it; the base edited it at the old path."""
+        from tests.conftest import _git
+
+        body = "".join(f"-- line {i}\n" for i in range(20))
+        macro = "{% macro f() %}\nwhere true\n" + body + "{% endmacro %}\n"
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/r.sql": "select * from t {{ f() }}",
+                              "macros/m.sql": macro})
+        repo.git("mv", "macros/m.sql", "macros/m2.sql")
+        repo.write("macros/m2.sql", macro.replace("where true", "where true cross join huge"))
+        repo.commit("pr")
+        assert repo.git("diff", "--name-status", "-M", "origin/main...HEAD").split()[0].startswith("R")
+        (repo.upstream / "macros/m.sql").write_text(macro.replace("-- line 19", "-- line 19, base"))
+        _git(repo.upstream, "commit", "-q", "-am", "base moves on")
+        repo.git("fetch", "-q", "origin")
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("r", "select * from t where true", checksum="r")))
+        repo.write("target/manifest.json", _manifest(_node("r", "select * from t where true cross join huge", checksum="r")))
+        tip = repo.git("rev-parse", "origin/main").strip()
+        items = {c.name: c.metadata for c in find_changed_dbt_models(_config(repo, resolved_base_ref=tip))}
+        assert "(macros/m2.sql)" in items["non-model dbt files"]["unknown_reason"]
+
+    @pytest.mark.parametrize("path", ["analyses/a.sql", "tests/assert_x.sql"])
+    def test_a_test_or_analysis_sql_both_changed_is_not_counted(self, checkout_repo, path):
+        """Neither changes a model, and a PR that changes only them reports no SQL changes."""
+        repo, tip = self._macro_on_both_sides(checkout_repo, path)
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("r", "select 1", checksum="r")))
+        repo.write("target/manifest.json", _manifest(_node("r", "select 1", checksum="r")))
+        assert find_changed_dbt_models(_config(repo, resolved_base_ref=tip)) == []
+
+    def test_test_path_yaml_both_changed_still_counts(self, checkout_repo):
+        repo, tip = self._macro_on_both_sides(checkout_repo, "tests/props.yml")
+        items = {c.name: c.metadata for c in find_changed_dbt_models(_config(repo, resolved_base_ref=tip))}
+        assert "(tests/props.yml)" in items["non-model dbt files"]["unknown_reason"]
+
+    def test_one_non_model_item_when_a_model_is_also_uncompiled(self, checkout_repo):
+        """The base-moved reason joins the selective-compile one, first."""
+        repo, tip = self._macro_on_both_sides(checkout_repo)
+        u = _node("u", None, checksum="u")
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("r", "select * from t where true", checksum="r"), u))
+        repo.write("target/manifest.json", _manifest(
+            _node("r", "select * from t where dt = current_date() cross join huge", checksum="r"), u))
+        items = [c for c in find_changed_dbt_models(_config(repo, resolved_base_ref=tip)) if c.name == "non-model dbt files"]
+        assert len(items) == 1
+        reason = items[0].metadata["unknown_reason"]
+        assert reason.startswith("1 changed file(s) outside model files were also changed by the base branch")
+        assert "; 1 changed file(s) outside model files (macros/m.sql) can change the SQL of 1 model(s)" in reason
+
+    def test_a_local_package_file_the_base_also_changed_later_is_unknown(self, checkout_repo):
+        repo, tip = self._macro_on_both_sides(
+            checkout_repo, "pkgs/shared/macros/m.sql", {"packages.yml": "packages:\n  - local: pkgs/shared\n"})
+        items = {c.name: c.metadata for c in find_changed_dbt_models(_config(repo, resolved_base_ref=tip))}
+        assert "pkgs/shared/macros/m.sql" in items["non-model dbt files"]["unknown_reason"]
+
+    def test_a_renamed_model_whose_old_file_the_base_changed_is_unknown(self, checkout_repo):
+        from tests.conftest import _git
+
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/old.sql": "select 1\n-- 1\n-- 2\n-- 3\n"})
+        repo.git("mv", "models/old.sql", "models/new.sql")
+        repo.write("models/new.sql", "select 2\n-- 1\n-- 2\n-- 3\n")
+        repo.commit("pr")
+        (repo.upstream / "models/old.sql").write_text("select 1\n-- 1\n-- 2\n-- 3, base\n")
+        _git(repo.upstream, "commit", "-q", "-am", "base moves on")
+        repo.git("fetch", "-q", "origin")
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("old", "select 1", checksum="o")))
+        repo.write("target/manifest.json", _manifest(_node("new", "select 2", checksum="n", path="models/new.sql")))
+        tip = repo.git("rev-parse", "origin/main").strip()
+        [item] = find_changed_dbt_models(_config(repo, resolved_base_ref=tip))
+        assert (item.name, item.production_sql) == ("new", "select 1")
+        assert item.metadata["unknown_reason"] == BASE_MOVED_REASON
+
+    def test_without_a_baseline_both_reasons_are_kept(self, checkout_repo):
+        repo, tip = self._base_moves_on(checkout_repo, ("models/a.sql", "select 3"))
+        (repo.path / ".diffcost-baseline/manifest.json").unlink()
+        [item] = find_changed_dbt_models(_config(repo, resolved_base_ref=tip))
+        assert item.metadata["unknown_reason"] == (
+            f"{BASE_MOVED_REASON}; no production baseline (no baseline manifest in this run)"
+        )
+
+    def test_a_failed_diff_of_the_base_fails_the_run(self, checkout_repo, monkeypatch):
+        repo, tip = self._base_moves_on(checkout_repo, ("models/b.sql", "select 6"))
+        def broken(*_):
+            raise GitError("Could not diff: boom")
+
+        monkeypatch.setattr("config.paths_changed_between", broken)
+        with pytest.raises(GitError, match="boom"):
+            find_changed_dbt_models(_config(repo, resolved_base_ref=tip))
+
+
+class TestRenamedModels:
+    """A model file git reports as renamed is compared with its old version in one row."""
+
+    def _renamed(self, checkout_repo, old_sql="select * from big", new_sql=None):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/old.sql": "select * from {{ ref('big') }}",
+                              "models/reader.sql": "select * from {{ ref('old') }}"})
+        repo.git("mv", "models/old.sql", "models/new.sql")
+        repo.write("models/reader.sql", "select * from {{ ref('new') }}")
+        repo.commit()
+        old = ("model.proj.old", _node("old", old_sql, checksum="c", relation="`p`.`prod`.`old`"), [])
+        new = ("model.proj.new", _node("new", new_sql or old_sql, checksum="c", path="models/new.sql",
+                                       relation="`p`.`prod`.`new`"), [])
+        def reader(rel, parent):
+            node = _node("reader", f"select * from {rel}", checksum=rel, relation="`p`.`prod`.`reader`")
+            return ("model.proj.reader", node, [parent])
+
+        repo.write(".diffcost-baseline/manifest.json", _graph(old, reader("`p`.`prod`.`old`", "model.proj.old")))
+        repo.write("target/manifest.json", _graph(new, reader("`p`.`prod`.`new`", "model.proj.new")))
+        return repo
+
+    def test_a_pure_rename_and_its_readers_are_not_listed(self, checkout_repo):
+        """Neither a Removed + New pair for the model, nor its reader (only `ref()` changed)."""
+        assert find_changed_dbt_models(_config(self._renamed(checkout_repo))) == []
+
+    def test_a_renamed_model_whose_sql_changed_is_one_row(self, checkout_repo):
+        repo = self._renamed(checkout_repo, new_sql="select * from big where dt = current_date()")
+        [item] = find_changed_dbt_models(_config(repo))
+        assert (item.name, item.path) == ("new", "models/new.sql")
+        assert item.metadata["unique_id"] == "model.proj.new"
+        assert item.production_sql == "select * from big"
+        assert item.pr_sql == "select * from big where dt = current_date()"
+
+    def test_without_rename_detection_it_stays_new_and_removed(self, checkout_repo):
+        """A file deleted and another added with different content: no pairing."""
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/old.sql": "select 1 from a, b, c, d"})
+        repo.git("rm", "-q", "models/old.sql")
+        repo.write("models/new.sql", "select * from somewhere_else")
+        repo.commit()
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("old", "select 1", checksum="o")))
+        repo.write("target/manifest.json", _manifest(_node("new", "select 2", checksum="n")))
+        items = {c.name: c for c in find_changed_dbt_models(_config(repo))}
+        assert (items["old"].pr_sql, items["new"].production_sql) == (None, None)
+
+    def _renamed_seed(self, checkout_repo, reader_sql_pr):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "seeds/countries.csv": "code,name\nAU,Australia\n",
+                              "models/reader.sql": "select * from {{ ref('countries') }}"})
+        repo.git("mv", "seeds/countries.csv", "seeds/country_codes.csv")
+        repo.write("models/reader.sql", "select * from {{ ref('country_codes') }}")
+        repo.commit()
+        def seed(name):
+            return (f"seed.proj.{name}", _node(name, None, checksum="csv", path=f"seeds/{name}.csv",
+                                               relation=f"`p`.`prod`.`{name}`", resource_type="seed"), [])
+
+        def reader(sql, parent):
+            return ("model.proj.reader", _node("reader", sql, checksum=sql), [parent])
+
+        repo.write(".diffcost-baseline/manifest.json", _graph(
+            seed("countries"), reader("select * from `p`.`prod`.`countries`", "seed.proj.countries")))
+        repo.write("target/manifest.json", _graph(
+            seed("country_codes"), reader(reader_sql_pr, "seed.proj.country_codes")))
+        return repo
+
+    def test_a_reader_of_a_renamed_seed_is_not_listed(self, checkout_repo):
+        repo = self._renamed_seed(checkout_repo, "select * from `p`.`prod`.`country_codes`")
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_a_reader_of_a_renamed_seed_is_analyzed_under_the_old_name(self, checkout_repo):
+        repo = self._renamed_seed(checkout_repo, "select code from `p`.`prod`.`country_codes`")
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "reader"
+        assert item.metadata["structural_pr_sql"] == "select code from `p`.`prod`.`countries`"
+
+    def test_renames_are_detected_whatever_the_repository_setting(self, checkout_repo):
+        repo = self._renamed(checkout_repo, new_sql="select 2")
+        repo.git("config", "diff.renames", "false")
+        [item] = find_changed_dbt_models(_config(repo))
+        assert (item.name, item.production_sql) == ("new", "select * from big")
+
+
+def _table(name, compiled="select 1", materialized="table", **config):
+    return _with(_node(name, compiled, checksum=name, relation=f"`p`.`prod`.`{name}`"), materialized=materialized, **config)
+
+
+class TestPartitioningAndClustering:
+    """Removing or changing a table's partitioning or clustering changes what its readers scan
+    once it is rebuilt: no dry run before the merge can price that."""
+
+    def _changed(self, checkout_repo, base_config, pr_config, base_mat="table", pr_mat="table", compiled=None):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/t.sql": "select 1",
+                              "models/schema.yml": "v1"})
+        repo.write("models/schema.yml", "v2")
+        repo.commit()
+        repo.write(".diffcost-baseline/manifest.json",
+                   _graph(("model.proj.t", _table("t", materialized=base_mat, **base_config), [])))
+        repo.write("target/manifest.json",
+                   _graph(("model.proj.t", _table("t", compiled or "select 1", materialized=pr_mat, **pr_config), [])))
+        return {c.name: c.metadata for c in find_changed_dbt_models(_config(repo))}
+
+    DAY = {"field": "event_date", "data_type": "date"}
+
+    @pytest.mark.parametrize("base, pr, expected", [
+        ({"partition_by": DAY}, {}, "partitioning (`partition_by`) removed"),
+        ({"partition_by": DAY}, {"partition_by": {"field": "created_at", "data_type": "date"}},
+         "partitioning (`partition_by`) changed"),
+        ({"partition_by": DAY}, {"partition_by": {**DAY, "granularity": "month"}}, "partitioning (`partition_by`) changed"),
+        ({"cluster_by": ["a", "b"]}, {"cluster_by": ["b", "a"]}, "clustering (`cluster_by`) changed"),
+        ({"cluster_by": "a"}, {}, "clustering (`cluster_by`) removed"),
+        ({"partition_by": DAY, "cluster_by": "a"}, {"cluster_by": "b"},
+         "partitioning (`partition_by`) removed and clustering (`cluster_by`) changed"),
+    ])
+    def test_removed_or_changed_is_an_unknown_cost_row(self, checkout_repo, base, pr, expected):
+        meta = self._changed(checkout_repo, base, pr)["t"]
+        assert meta["unknown_reason"].startswith(f"{expected} in this PR")
+
+    @pytest.mark.parametrize("base, pr", [
+        ({}, {"partition_by": {"field": "event_date", "data_type": "date"}, "cluster_by": "a"}),  # added
+        ({"partition_by": {"field": "event_date", "data_type": "date"}},
+         {"partition_by": {"Field": "EVENT_DATE", "data_type": "DATE", "granularity": "day"}}),  # same, spelled out
+        ({"cluster_by": "a"}, {"cluster_by": ["A"]}),
+        ({"partition_by": {"field": "n", "data_type": "int64", "range": {"start": 0, "end": 10, "interval": 1}}},
+         {"partition_by": {"data_type": "int64", "field": "n", "range": {"interval": 1, "end": 10, "start": 0}}}),
+    ])
+    def test_added_or_unchanged_is_not_listed(self, checkout_repo, base, pr):
+        assert self._changed(checkout_repo, base, pr) == {}
+
+    def test_a_view_that_was_a_partitioned_table(self, checkout_repo):
+        meta = self._changed(checkout_repo, {"partition_by": self.DAY}, {}, pr_mat="view")["t"]
+        assert meta["unknown_reason"].startswith("partitioning (`partition_by`) removed")
+
+    def test_an_ephemeral_model_is_priced_through_its_readers(self, checkout_repo):
+        assert self._changed(checkout_repo, {"partition_by": self.DAY}, {}, pr_mat="ephemeral") == {}
+
+    def test_a_view_never_had_partitioning_to_lose(self, checkout_repo):
+        assert self._changed(checkout_repo, {"partition_by": self.DAY}, {}, base_mat="view", pr_mat="view") == {}
+
+    def test_the_reason_goes_on_a_row_that_changed_anyway(self, checkout_repo):
+        items = self._changed(checkout_repo, {"partition_by": self.DAY}, {}, compiled="select 2")
+        assert list(items) == ["t"]
+        assert items["t"]["unknown_reason"].startswith("partitioning (`partition_by`) removed")
+
+    def test_a_renamed_model_that_loses_its_partitioning(self, checkout_repo):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/old.sql": "select 1"})
+        repo.git("mv", "models/old.sql", "models/new.sql")
+        repo.commit()
+        old = ("model.proj.old", _table("old", partition_by=self.DAY), [])
+        new = ("model.proj.new", _with(_node("new", "select 1", checksum="old", path="models/new.sql",
+                                             relation="`p`.`prod`.`new`"), materialized="table"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(old))
+        repo.write("target/manifest.json", _graph(new))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "new" and item.production_sql == "select 1"
+        assert item.metadata["unknown_reason"].startswith("partitioning (`partition_by`) removed in this PR")
+
+    def test_an_uncompiled_model_that_loses_its_partitioning(self, checkout_repo):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/t.sql": "select 1", "models/m.sql": "select 2",
+                              "models/schema.yml": "v1"})
+        repo.write("models/schema.yml", "v2")  # where the config is set
+        repo.commit()
+        m = ("model.proj.m", _node("m", "select 2", checksum="m"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(m, ("model.proj.t", _table("t", partition_by=self.DAY), [])))
+        repo.write("target/manifest.json", _graph(m, ("model.proj.t", _table("t", compiled=None), [])))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "t"
+        assert item.metadata["unknown_reason"].startswith("partitioning (`partition_by`) removed in this PR")
+
+    def _not_set_by_this_pr(self, checkout_repo, edit=None):
+        """The baseline has partitioning the PR manifest doesn't, though the PR changed no
+        file that could set it (a baseline compiled from another commit)."""
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/t.sql": "select 1", "models/m.sql": "select 2",
+                              "README.md": "v1"})
+        repo.write(*(edit or ("README.md", "v2")))
+        repo.commit()
+        m = ("model.proj.m", _node("m", "select 2", checksum="m"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(m, ("model.proj.t", _table("t", partition_by=self.DAY), [])))
+        pr_t = _table("t")
+        if edit and edit[0] == "models/t.sql":
+            pr_t["checksum"]["checksum"] = "t-edited"  # compiled from the edited file
+        repo.write("target/manifest.json", _graph(m, ("model.proj.t", pr_t, [])))
+        return repo
+
+    def test_a_difference_no_changed_file_can_set_is_only_a_warning(self, checkout_repo, capsys):
+        repo = self._not_set_by_this_pr(checkout_repo)
+        assert find_changed_dbt_models(_config(repo)) == []
+        out = capsys.readouterr().out
+        assert "::warning::1 model(s) or snapshot(s) have different partitioning or clustering" in out
+        assert "dbt#how-the-baseline-step-works" in out
+
+    @pytest.mark.parametrize("edit", [
+        ("models/t.sql", "{{ config(materialized='table') }} select 1"),  # the model's own file
+        ("dbt_project.yml", "name: proj\nmodels:\n  +partition_by: null\n"),
+        ("macros/partitions.sql", "{% macro p() %}{% endmacro %}"),
+    ])
+    def test_a_change_to_a_file_that_can_set_it_counts(self, checkout_repo, edit):
+        repo = self._not_set_by_this_pr(checkout_repo, edit)
+        items = {c.name: c.metadata for c in find_changed_dbt_models(_config(repo))}
+        assert items["t"]["unknown_reason"].startswith("partitioning (`partition_by`) removed in this PR")
+
+    @pytest.mark.parametrize("base, pr", [
+        ({"cluster_by": "a,b"}, {"cluster_by": ["a", "b"]}),
+        ({"cluster_by": ["a", "b"]}, {"cluster_by": "a, b"}),
+        ({"cluster_by": ["customer_id"]}, {"cluster_by": ["customer_id", "order_date"]}),  # columns added after
+    ])
+    def test_the_same_or_extended_clustering_is_not_listed(self, checkout_repo, base, pr):
+        assert self._changed(checkout_repo, base, pr) == {}
+
+    @pytest.mark.parametrize("base, pr", [
+        ({"cluster_by": ["a", "b"]}, {"cluster_by": ["a"]}),  # a column removed
+        ({"cluster_by": ["a"]}, {"cluster_by": ["b", "a"]}),  # a column put first
+    ])
+    def test_shortened_or_reordered_clustering_is_listed(self, checkout_repo, base, pr):
+        meta = self._changed(checkout_repo, base, pr)["t"]
+        assert meta["unknown_reason"].startswith("clustering (`cluster_by`) changed in this PR")
+
+    def _turned_into_a_view(self, checkout_repo, base_mat="table", readers=True, **base_config):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/t.sql": "select 1", "models/r.sql": "select 2"})
+        repo.write("models/t.sql", "{{ config(materialized='view') }} select 1")
+        repo.commit()
+        reader = [("model.proj.r", _node("r", "select * from `p`.`prod`.`t`", checksum="r"), ["model.proj.t"])]
+        base = _table("t", materialized=base_mat, **base_config)
+        pr = _with(_node("t", "select 1", checksum="t2", relation="`p`.`prod`.`t`"), materialized="view")
+        repo.write(".diffcost-baseline/manifest.json", _graph(("model.proj.t", base, []), *(reader if readers else [])))
+        repo.write("target/manifest.json", _graph(("model.proj.t", pr, []), *(reader if readers else [])))
+        return {c.name: c.metadata for c in find_changed_dbt_models(_config(repo))}
+
+    @pytest.mark.parametrize("base_mat", ["table", "incremental"])
+    def test_a_table_turned_into_a_view_that_is_read_is_unknown(self, checkout_repo, base_mat):
+        meta = self._turned_into_a_view(checkout_repo, base_mat)["t"]
+        assert meta["unknown_reason"] == (
+            "materialized as a view (its readers will run its query) in this PR: what the models that read it scan "
+            "changes after the merge, which a dry run can't price before it"
+        )
+
+    def test_a_partitioned_table_turned_into_a_read_view_gets_one_reason(self, checkout_repo):
+        meta = self._turned_into_a_view(checkout_repo, partition_by=self.DAY)["t"]
+        assert meta["unknown_reason"].startswith("materialized as a view (its readers will run its query) in this PR")
+        assert "partitioning" not in meta["unknown_reason"]
+
+    def test_a_table_turned_into_a_view_nothing_reads_is_priced(self, checkout_repo):
+        meta = self._turned_into_a_view(checkout_repo, readers=False)["t"]
+        assert "unknown_reason" not in meta
+
+
+class TestMovedAndRenamedReaders:
+    def test_a_model_moved_to_another_directory_is_not_listed(self, checkout_repo):
+        """Same name, so the same unique_id: the PR manifest records the new path."""
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/a.sql": "select 1"})
+        (repo.path / "models/staging").mkdir()
+        repo.git("mv", "models/a.sql", "models/staging/a.sql")
+        repo.commit()
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("a", "select 1", checksum="a")))
+        repo.write("target/manifest.json", _manifest(_node("a", "select 1", checksum="a", path="models/staging/a.sql")))
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_a_moved_model_with_a_stale_manifest_is_unknown(self, checkout_repo):
+        """The PR manifest still has the old path: it wasn't compiled from this checkout."""
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/a.sql": "select 1", "models/m.sql": "select 2"})
+        (repo.path / "models/staging").mkdir()
+        repo.git("mv", "models/a.sql", "models/staging/a.sql")
+        repo.commit()
+        m = _node("m", "select 2", checksum="m")
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("a", "select 1", checksum="a"), m))
+        repo.write("target/manifest.json", _manifest(_node("a", "select 1", checksum="a"), m))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "a"
+        assert item.metadata["unknown_reason"] == "the model file changed but the PR manifest was not recompiled"
+
+    def test_a_moved_snapshot_is_not_listed(self, checkout_repo):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/m.sql": "select 1",
+                              "snapshots/s.sql": "{% snapshot s %}select 1{% endsnapshot %}"})
+        (repo.path / "snapshots/core").mkdir()
+        repo.git("mv", "snapshots/s.sql", "snapshots/core/s.sql")
+        repo.commit()
+        m = ("model.proj.m", _node("m", "select 1", checksum="m"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(m, ("snapshot.proj.s", _snapshot("s", "select 1", "s"), [])))
+        repo.write("target/manifest.json", _graph(
+            m, ("snapshot.proj.s", _snapshot("s", "select 1", "s", path="snapshots/core/s.sql"), []),
+        ))
+        assert find_changed_dbt_models(_config(repo)) == []
+
+    def test_a_reader_of_a_renamed_model_is_analyzed_under_the_old_name(self, checkout_repo):
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/old.sql": "select 1 as id",
+                              "models/reader.sql": "select id from {{ ref('old') }}"})
+        repo.git("mv", "models/old.sql", "models/new.sql")
+        repo.write("models/reader.sql", "select id, 2 as discount from {{ ref('new') }}")
+        repo.commit()
+        old = ("model.proj.old", _node("old", "select 1 as id", checksum="o", relation="`p`.`prod`.`old`"), [])
+        new = ("model.proj.new", _node("new", "select 1 as id", checksum="o", path="models/new.sql",
+                                       relation="`p`.`prod`.`new`"), [])
+        base_reader = ("model.proj.reader", _node("reader", "select id from `p`.`prod`.`old`", checksum="r1"),
+                       ["model.proj.old"])
+        pr_reader = ("model.proj.reader", _node("reader", "select id, 2 as discount from `p`.`prod`.`new`",
+                                                checksum="r2"), ["model.proj.new"])
+        repo.write(".diffcost-baseline/manifest.json", _graph(old, base_reader))
+        repo.write("target/manifest.json", _graph(new, pr_reader))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "reader"
+        assert item.pr_sql == "select id, 2 as discount from `p`.`prod`.`new`"  # what the dry run prices
+        assert item.metadata["structural_pr_sql"] == "select id, 2 as discount from `p`.`prod`.`old`"
+        assert item.metadata["new_upstream_relations"] == ["`p`.`prod`.`new`"]
+
+    def test_no_mapped_copy_when_nothing_maps(self, checkout_repo):
+        repo = checkout_repo({"models/a.sql": "select 1"})
+        repo.write("models/a.sql", "select 2")
+        repo.commit()
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("a", "select 1", checksum="a1")))
+        repo.write("target/manifest.json", _manifest(_node("a", "select 2", checksum="a2")))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert "structural_pr_sql" not in item.metadata
+
+    def test_a_macro_change_with_an_uncompiled_snapshot_is_unknown(self, checkout_repo):
+        """A snapshot compiled in one manifest only can't show the macro's effect either."""
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/m.sql": "select 1",
+                              "snapshots/s.sql": "{% snapshot s %}select {{ m() }}{% endsnapshot %}",
+                              "macros/m.sql": "{% macro m() %}1{% endmacro %}"})
+        repo.write("macros/m.sql", "{% macro m() %}* from big{% endmacro %}")
+        repo.commit()
+        m = ("model.proj.m", _node("m", "select 1", checksum="m"), [])
+        repo.write(".diffcost-baseline/manifest.json", _graph(m, ("snapshot.proj.s", _snapshot("s", "select 1", "s"), [])))
+        repo.write("target/manifest.json", _graph(m, ("snapshot.proj.s", _snapshot("s", None, "s"), [])))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.name == "non-model dbt files"
+        assert "1 model(s) or snapshot(s) that are not compiled in both manifests" in item.metadata["unknown_reason"]
+
+    def test_a_path_only_the_baseline_has_proves_nothing(self, checkout_repo):
+        """A baseline saved before the base branch moved the file: the PR edits it in its new
+        place, and a PR manifest compiled from the base branch still has the old SQL."""
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/staging/a.sql": "select 1"})
+        repo.write("models/staging/a.sql", "select 1, 2")
+        repo.commit()
+        repo.write(".diffcost-baseline/manifest.json", _manifest(_node("a", "select 1", checksum="a")))
+        repo.write("target/manifest.json", _manifest(_node("a", "select 1", checksum="a", path="models/staging/a.sql")))
+        [item] = find_changed_dbt_models(_config(repo))
+        assert item.metadata["unknown_reason"] == "the model file changed but the PR manifest was not recompiled"

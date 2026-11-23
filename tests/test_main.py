@@ -1859,3 +1859,160 @@ class TestPlainSqlQueryParameters:
         )
         assert "Cost unavailable: the PR version uses query parameters that have no value: @\u2060tags (ARRAY), ? (INT64)" in body
         assert "BigQuery can't estimate some queries" not in body  # the row-level security / lower-bound hint
+
+
+class TestApiUrl:
+    @pytest.mark.parametrize("value, expected", [
+        ("https://diffcost.dev/", "https://diffcost.dev"),
+        ("https://api.diffcost.dev//", "https://api.diffcost.dev"),
+        ("http://localhost:8080/", "http://localhost:8080"),
+        ("https://diffcost.dev", "https://diffcost.dev"),
+    ])
+    def test_a_trailing_slash_is_dropped(self, monkeypatch, value, expected):
+        """Request paths are appended to it: `https://diffcost.dev/` would ask for `//v1/config`."""
+        from main import _get_api_url
+
+        monkeypatch.setenv("DIFFCOST_API_URL", value)
+        assert _get_api_url() == expected
+
+    def test_another_host_falls_back_to_the_default(self, monkeypatch, capsys):
+        from main import _get_api_url
+
+        monkeypatch.setenv("DIFFCOST_API_URL", "https://diffcost.dev.example.com/")
+        assert _get_api_url() == "https://diffcost.dev"
+        assert "must be an official DiffCost domain" in capsys.readouterr().out
+
+
+class TestStructuralAnalysisOfRenamedUpstreams:
+    """A dbt reader of a renamed or moved model reads the same table under its new name:
+    structural analysis compares it under the baseline's name, the dry run prices the PR's SQL."""
+
+    _OLD = "SELECT id FROM `p`.`prod`.`orders`"
+    _NEW = "SELECT id, discount FROM `p`.`prod`.`orders_v2`"
+    _MAPPED = "SELECT id, discount FROM `p`.`prod`.`orders`"
+
+    def _depends(self):
+        return {"cost_before": 1.0, "cost_after": None, "bytes_before": 1000, "bytes_after": None,
+                "error": None, "unmaterialized_upstream": False, "pr_depends_on_new_objects": True}
+
+    def test_a_reader_that_adds_a_column_is_not_costed_and_does_not_block(self, harness):
+        harness.find.return_value = [_item("reader", self._OLD, self._NEW, adapter="dbt", changed_upstream=True,
+                                           structural_pr_sql=self._MAPPED)]
+        harness.pair.return_value = self._depends()
+        run(_paid(_make_config(), absolute_usd=5.0))
+        assert harness.outputs()["policy_exceeded"] == "false"
+        # The PR's own SQL first; its "Not found" is retried against the existing table, which
+        # fails here too, so the first result stands
+        assert [c.args[2] for c in harness.pair.call_args_list] == [self._NEW, self._MAPPED]
+        body = harness.post.call_args.args[3]
+        assert "Not costed: depends on objects this PR creates" in body
+        assert "New table reference" not in body and self._MAPPED not in body
+        assert self._MAPPED not in json.dumps(harness.send.call_args.args[1])
+
+    def test_without_the_mapping_the_new_name_is_a_new_table(self, harness):
+        harness.find.return_value = [_item("reader", self._OLD, self._NEW, adapter="dbt", changed_upstream=True)]
+        harness.pair.return_value = self._depends()
+        run(_paid(_make_config(), absolute_usd=5.0))
+        assert harness.outputs()["policy_exceeded"] == "true"
+
+    def test_a_reader_that_also_drops_a_partition_filter_still_blocks(self, harness):
+        harness.find.return_value = [_item(
+            "reader", self._OLD + " WHERE event_date >= '2026-01-01'", self._NEW, adapter="dbt",
+            changed_upstream=True, structural_pr_sql=self._MAPPED,
+        )]
+        harness.pair.return_value = self._depends()
+        run(_paid(_make_config(), absolute_usd=5.0))
+        assert harness.outputs()["policy_exceeded"] == "true"
+        assert "Partition filter removed" in harness.post.call_args.args[3]
+
+
+
+class TestReadersOfRenamedModelsArePriced:
+    """End to end with the dbt adapter: a model renamed in the PR isn't built until the merge,
+    so a reader that changes too is priced against the renamed model's existing table."""
+
+    _STG = "select 1 as order_id, '2026-01-01' as order_date, 'x' as payload"
+    _FCT_BASE = "SELECT order_id FROM `p`.`prod`.`stg_orders` WHERE order_date >= '2026-01-01'"
+    _FCT_PR = "SELECT order_id, payload FROM `p`.`prod`.`stg_orders_v2` WHERE order_date >= '2020-01-01'"
+    _FCT_MAPPED = "SELECT order_id, payload FROM `p`.`prod`.`stg_orders` WHERE order_date >= '2020-01-01'"
+
+    def _repo(self, checkout_repo):
+        import json as _json
+
+        repo = checkout_repo({"dbt_project.yml": "name: proj", "models/stg_orders.sql": self._STG,
+                              "models/fct.sql": "select order_id from {{ ref('stg_orders') }}",
+                              "models/ref_only.sql": "select order_id from {{ ref('stg_orders') }}"})
+        repo.git("mv", "models/stg_orders.sql", "models/stg_orders_v2.sql")
+        repo.write("models/fct.sql", "select order_id, payload from {{ ref('stg_orders_v2') }}")
+        repo.write("models/ref_only.sql", "select order_id from {{ ref('stg_orders_v2') }}")
+        repo.commit()
+
+        def node(name, sql, checksum, parents=()):
+            return {"resource_type": "model", "name": name, "original_file_path": f"models/{name}.sql",
+                    "compiled_code": sql, "checksum": {"name": "sha256", "checksum": checksum},
+                    "relation_name": f"`p`.`prod`.`{name}`", "depends_on": {"nodes": list(parents)},
+                    "config": {"materialized": "table"}}
+
+        def manifest(stg, fct_sql, ref_sql, fct_sum, ref_sum):
+            stg_id = f"model.proj.{stg}"
+            return _json.dumps({"nodes": {
+                stg_id: node(stg, self._STG, "s"),
+                "model.proj.fct": node("fct", fct_sql, fct_sum, [stg_id]),
+                "model.proj.ref_only": node("ref_only", ref_sql, ref_sum, [stg_id]),
+            }})
+
+        repo.write(".diffcost-baseline/manifest.json", manifest(
+            "stg_orders", self._FCT_BASE, "SELECT order_id FROM `p`.`prod`.`stg_orders`", "f1", "r1"))
+        repo.write("target/manifest.json", manifest(
+            "stg_orders_v2", self._FCT_PR, "SELECT order_id FROM `p`.`prod`.`stg_orders_v2`", "f2", "r2"))
+        return repo
+
+    def _config(self, repo):
+        config = _make_config(sql_paths="", manifest_path="target/manifest.json", workspace=str(repo.path),
+                              resolved_base_ref=repo.git("rev-parse", "origin/main").strip())
+        return _paid(config, absolute_usd=5.0)
+
+    @staticmethod
+    def _not_found(before):
+        return {"cost_before": before, "cost_after": None, "bytes_before": 10, "bytes_after": None, "error": None,
+                "unmaterialized_upstream": False, "pr_depends_on_new_objects": True, "pr_error": None,
+                "pr_missing_object": {"kind": "table", "name": "p:prod.stg_orders_v2"}}
+
+    def test_the_reader_is_priced_and_its_increase_blocks(self, checkout_repo, harness):
+        repo = self._repo(checkout_repo)
+
+        def pair(client, production_sql, pr_sql, cost_per_tb=6.25, **options):
+            if pr_sql and "stg_orders_v2" in pr_sql:
+                return self._not_found(0.01)
+            return _pair(0.01, 9.0)
+
+        harness.pair.side_effect = pair
+        run(self._config(repo))
+        out = harness.outputs()
+        assert out["files_analyzed"] == "1"  # the renamed model and the ref-only reader aren't listed
+        assert out["items_unknown"] == "0" and out["policy_exceeded"] == "true"
+        assert [c.args[2] for c in harness.pair.call_args_list] == [self._FCT_PR, self._FCT_MAPPED]
+        body = harness.post.call_args.args[3]
+        assert "Not costed" not in body
+        assert self._FCT_MAPPED not in body
+        sent = json.dumps(harness.send.call_args.args[1])
+        assert self._FCT_MAPPED not in sent and "stg_orders" not in sent
+
+    def test_when_the_existing_table_cannot_be_read_either_it_stays_not_costed(self, checkout_repo, harness):
+        repo = self._repo(checkout_repo)
+        harness.pair.side_effect = lambda client, production_sql, pr_sql, *a, **k: self._not_found(0.01)
+        run(self._config(repo))
+        out = harness.outputs()
+        assert "Not costed: depends on objects this PR creates" in harness.post.call_args.args[3]
+        assert len(harness.pair.call_args_list) == 2
+        assert self._FCT_MAPPED not in harness.post.call_args.args[3]
+        assert self._FCT_MAPPED not in json.dumps(harness.send.call_args.args[1])
+        assert out["files_analyzed"] == "1"
+
+    def test_an_unrecognized_name_is_not_retried(self, harness):
+        harness.find.return_value = [_item("reader", "SELECT id FROM `p`.`d`.`a`", "SELECT id, x FROM `p`.`d`.`b`",
+                                           adapter="dbt", changed_upstream=True,
+                                           structural_pr_sql="SELECT id, x FROM `p`.`d`.`a`")]
+        harness.pair.return_value = {**self._not_found(1.0), "pr_error": "Unrecognized name: x"}
+        run(_paid(_make_config(), absolute_usd=5.0))
+        assert harness.pair.call_count == 1
